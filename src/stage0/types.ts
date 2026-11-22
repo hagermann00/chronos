@@ -63,14 +63,27 @@ export interface External86Manifest {
   rules: Rule86Entry[];
 }
 
+export interface CanaryAgentIdentityConfig {
+  identityLabel: string;
+  principalKind:
+    | 'INTERACTIVE_OWNER'
+    | 'CLI_AGENT_SAME_UID'
+    | 'ISOLATED_AGENT_UID'
+    | 'SEARCH_SUBPROCESS';
+  osUsername?: string; // Explicit OS account/principal to probe; never silently substituted with current user
+  expectedAccess: 'MUST_DENY' | 'DIAGNOSTIC_EXPOSURE_CHECK';
+}
+
 export interface Stage0Config {
   configVersion: '1.0.0';
   hostOsMode: OsPlatformMode;
   scanRootsAllowlist: ScanRootEntry[];
   external86ManifestPath: string;
+  expectedExternal86ManifestSha256?: string; // Independently trusted 64-hex SHA-256 digest of the external 86 manifest
   zoneBOutputDir: string;
   universalHarnessProbePaths?: string[];
   existingSqliteLedgerPaths?: string[];
+  canaryAgentIdentities?: CanaryAgentIdentityConfig[];
   workflowWeights: Record<VendorEcosystemId, WorkflowImportanceTier>;
 }
 
@@ -116,6 +129,7 @@ export type CanaryIdentityOutcome =
 export interface MultiIdentityCanaryResult {
   identityLabel: string;
   principalKind: 'INTERACTIVE_OWNER' | 'CLI_AGENT_SAME_UID' | 'ISOLATED_AGENT_UID' | 'SEARCH_SUBPROCESS';
+  expectedAccess?: 'MUST_DENY' | 'DIAGNOSTIC_EXPOSURE_CHECK';
   probeOperationsTested: Array<'READ_FILE' | 'LIST_DIR' | 'SEARCH_TEXT'>;
   outcome: CanaryIdentityOutcome;
   osErrorCode: string;
@@ -154,6 +168,7 @@ export interface SanitizedStage0Report {
     allowlistRootCount: number;
     manifestId: string;
     manifestSha256: string;
+    manifestIntegrityVerified?: boolean;
     pruned86ByRuleId: Record<string, number>;
     reparseOrSymlinkSkippedCount: number;
     mountCrossingSkippedCount: number;

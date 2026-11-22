@@ -133,10 +133,22 @@ export function auditSanitizedStage0Report(candidate: unknown): SanitizationAudi
 
   // Ensure pruned86ByRuleId uses opaque rule IDs only, never path slashes
   const secAudit = obj.securityAudit as Record<string, unknown> | undefined;
-  if (secAudit && secAudit.pruned86ByRuleId && typeof secAudit.pruned86ByRuleId === 'object') {
-    for (const ruleKey of Object.keys(secAudit.pruned86ByRuleId as Record<string, unknown>)) {
-      if (ruleKey.includes('/') || ruleKey.includes('\\') || ruleKey.includes(':')) {
-        violations.push(`RAW_PATH_IN_86_RULE_KEY:${ruleKey}`);
+  if (secAudit) {
+    if (secAudit.manifestIntegrityVerified === false) {
+      violations.push('UNVERIFIED_MANIFEST_INTEGRITY');
+    }
+    if (
+      secAudit.manifestSha256 !== undefined &&
+      (typeof secAudit.manifestSha256 !== 'string' ||
+        !/^[a-f0-9]{64}$/i.test(secAudit.manifestSha256))
+    ) {
+      violations.push('INVALID_MANIFEST_SHA256_FORMAT');
+    }
+    if (secAudit.pruned86ByRuleId && typeof secAudit.pruned86ByRuleId === 'object') {
+      for (const ruleKey of Object.keys(secAudit.pruned86ByRuleId as Record<string, unknown>)) {
+        if (ruleKey.includes('/') || ruleKey.includes('\\') || ruleKey.includes(':')) {
+          violations.push(`RAW_PATH_IN_86_RULE_KEY:${ruleKey}`);
+        }
       }
     }
   }

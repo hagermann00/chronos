@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,12 +7,15 @@ import {
   matchArchiveEntryAgainst86,
   Stage0FailClosedError,
   validateStage0Preconditions,
+  verifyManifestSha256,
 } from './pathSecurity.ts';
 import { assertSanitizedStage0Report } from './sanitizer.ts';
 import type {
   External86Manifest,
   FormatInventoryRecord,
   MultiIdentityCanaryResult,
+  OsPlatformMode,
+  Rule86Entry,
   SanitizedStage0Report,
   SqliteTableSchemaSummary,
   Stage0Config,
@@ -40,6 +42,211 @@ const ALL_ECOSYSTEMS: VendorEcosystemId[] = [
   'deepseek',
   'unknown_structured',
 ];
+
+const UNSCANNABLE_ARCHIVE_EXTS = new Set([
+  '.tar',
+  '.tgz',
+  '.gz',
+  '.7z',
+  '.rar',
+  '.bz2',
+  '.xz',
+]);
+
+export type SafeOpenFailureReason =
+  | 'SYMLINK_RACE'
+  | 'HARDLINK_RACE'
+  | 'REVOKED_INODE_RACE'
+  | 'PATH_OR_RULE_RACE'
+  | 'STAT_IDENTITY_MISMATCH'
+  | 'OPEN_OR_FSTAT_ERROR';
+
+export type SafeOpenResult =
+  | { ok: true; fd: number; fstat: fs.Stats }
+  | { ok: false; reason: SafeOpenFailureReason; matchedRuleId?: string };
+
+/**
+ * Atomically opens a regular file with O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+ * and verifies post-open fstat() + Linux /proc/self/fd containment invariants against the
+ * pre-open lstat() snapshot to eliminate check-to-open (TOCTOU) symlink, hardlink, FIFO,
+ * and mount/rename races before any payload bytes are read.
+ */
+export function openRegularFileNoFollowVerified(params: {
+  fullPath: string;
+  entryName: string;
+  expectedStat: fs.Stats;
+  rootRealPath: string;
+  mode: OsPlatformMode;
+  ntfsCaseSensitiveDir?: boolean;
+  revokedPosixDevInos: Set<string>;
+  rules: Rule86Entry[];
+}): SafeOpenResult {
+  const fsConsts = fs.constants as Record<string, number>;
+  const openFlags =
+    fs.constants.O_RDONLY |
+    (fs.constants.O_NOFOLLOW ?? 0) |
+    (fs.constants.O_NONBLOCK ?? 0) |
+    (fsConsts.O_CLOEXEC ?? 0);
+
+  let fd: number;
+  try {
+    fd = fs.openSync(params.fullPath, openFlags);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ELOOP') {
+      return { ok: false, reason: 'SYMLINK_RACE' };
+    }
+    return { ok: false, reason: 'OPEN_OR_FSTAT_ERROR' };
+  }
+
+  try {
+    const fst = fs.fstatSync(fd);
+
+    if (!fst.isFile()) {
+      fs.closeSync(fd);
+      return { ok: false, reason: 'STAT_IDENTITY_MISMATCH' };
+    }
+
+    if (fst.dev !== params.expectedStat.dev || fst.ino !== params.expectedStat.ino) {
+      fs.closeSync(fd);
+      return { ok: false, reason: 'STAT_IDENTITY_MISMATCH' };
+    }
+
+    const postDevIno = `${fst.dev}:${fst.ino}`;
+    if (params.revokedPosixDevInos.has(postDevIno)) {
+      fs.closeSync(fd);
+      const hit = evaluatePreOpen86Rules({
+        candidatePath: params.fullPath,
+        entryName: params.entryName,
+        mode: params.mode,
+        ntfsCaseSensitiveDir: params.ntfsCaseSensitiveDir,
+        posixDevIno: postDevIno,
+        rules: params.rules,
+      });
+      return {
+        ok: false,
+        reason: 'REVOKED_INODE_RACE',
+        matchedRuleId: hit.ruleId ?? 'R86_INODE_HIT',
+      };
+    }
+
+    if (fst.nlink > 1) {
+      fs.closeSync(fd);
+      return { ok: false, reason: 'HARDLINK_RACE' };
+    }
+
+    if ((fst.mode & 0o444) === 0) {
+      fs.closeSync(fd);
+      return { ok: false, reason: 'OPEN_OR_FSTAT_ERROR' };
+    }
+
+    // On Linux, verify kernel-resolved descriptor path to defeat intermediate directory symlink swaps
+    if (process.platform === 'linux') {
+      try {
+        const fdRealPath = fs.readlinkSync(`/proc/self/fd/${fd}`);
+        const rootPrefix = params.rootRealPath.endsWith('/')
+          ? params.rootRealPath
+          : `${params.rootRealPath}/`;
+        if (fdRealPath.endsWith(' (deleted)') || !fdRealPath.startsWith(rootPrefix)) {
+          fs.closeSync(fd);
+          return { ok: false, reason: 'SYMLINK_RACE' };
+        }
+        const postRuleCheck = evaluatePreOpen86Rules({
+          candidatePath: fdRealPath,
+          entryName: path.basename(fdRealPath),
+          mode: params.mode,
+          ntfsCaseSensitiveDir: params.ntfsCaseSensitiveDir,
+          posixDevIno: postDevIno,
+          rules: params.rules,
+        });
+        if (postRuleCheck.matched) {
+          fs.closeSync(fd);
+          return {
+            ok: false,
+            reason: 'PATH_OR_RULE_RACE',
+            matchedRuleId: postRuleCheck.ruleId ?? 'R86_POST_OPEN_HIT',
+          };
+        }
+      } catch {
+        fs.closeSync(fd);
+        return { ok: false, reason: 'OPEN_OR_FSTAT_ERROR' };
+      }
+    }
+
+    return { ok: true, fd, fstat: fst };
+  } catch {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // ignore close error
+    }
+    return { ok: false, reason: 'OPEN_OR_FSTAT_ERROR' };
+  }
+}
+
+/**
+ * Verifies a directory before readdir() using O_DIRECTORY | O_NOFOLLOW where supported
+ * and checks mount-device identity + Linux /proc/self/fd containment inside rootRealPath.
+ */
+function verifyDirectoryNoFollow(params: {
+  dirPath: string;
+  rootRealPath: string;
+  rootDirDev: number;
+  submountPaths: Set<string>;
+}): 'OK' | 'SYMLINK' | 'MOUNT_CROSSING' | 'ERROR' {
+  if (params.submountPaths.has(params.dirPath)) {
+    return 'MOUNT_CROSSING';
+  }
+
+  const fsConsts = fs.constants as Record<string, number>;
+  const oDirectory = fsConsts.O_DIRECTORY;
+  if (process.platform !== 'win32' && typeof oDirectory === 'number') {
+    const dirFlags =
+      fs.constants.O_RDONLY |
+      oDirectory |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fsConsts.O_CLOEXEC ?? 0);
+    let dirFd: number | null = null;
+    try {
+      dirFd = fs.openSync(params.dirPath, dirFlags);
+      const fst = fs.fstatSync(dirFd);
+      if (!fst.isDirectory()) return 'ERROR';
+      if (fst.dev !== params.rootDirDev) return 'MOUNT_CROSSING';
+      if (process.platform === 'linux') {
+        const realDir = fs.readlinkSync(`/proc/self/fd/${dirFd}`);
+        const rootPrefix = params.rootRealPath.endsWith('/')
+          ? params.rootRealPath
+          : `${params.rootRealPath}/`;
+        if (realDir !== params.rootRealPath && !realDir.startsWith(rootPrefix)) {
+          return 'SYMLINK';
+        }
+      }
+      return 'OK';
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ELOOP') return 'SYMLINK';
+      return 'ERROR';
+    } finally {
+      if (dirFd !== null) {
+        try {
+          fs.closeSync(dirFd);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  try {
+    const st = fs.lstatSync(params.dirPath);
+    if (st.isSymbolicLink()) return 'SYMLINK';
+    if (!st.isDirectory()) return 'ERROR';
+    if (st.dev !== params.rootDirDev) return 'MOUNT_CROSSING';
+    return 'OK';
+  } catch {
+    return 'ERROR';
+  }
+}
 
 /**
  * Inspects a .zip file's End-of-Central-Directory (EOCD) and Central Directory headers
@@ -145,35 +352,63 @@ function inspectZipCentralDirectoryHeadersOnly(
 /**
  * Queries SQLite DDL strictly via read-only immutable URI (`mode=ro&immutable=1`)
  * so zero `-wal`, `-shm`, or `-journal` files are ever created in Zone A.
- * Never executes SELECT on user data payloads (only sqlite_master structural schema).
+ * Uses O_NOFOLLOW + fstat verification (and /proc/self/fd/<fd> on Linux) to eliminate
+ * pathname check-to-open TOCTOU races. Never executes SELECT on user data payloads.
  */
 export function inspectSqliteSchemaImmutableReadOnly(
   sqlitePath: string,
-  ledgerAlias: string
+  ledgerAlias: string,
+  expectedStat?: Pick<fs.Stats, 'dev' | 'ino'>
 ): SqliteTableSchemaSummary[] | null {
   try {
     const pyScript = `
-import json, sqlite3, sys, urllib.parse
+import json, os, sqlite3, stat, sys, urllib.parse
 p = sys.argv[1]
-uri = "file:" + urllib.parse.quote(p) + "?mode=ro&immutable=1"
-conn = sqlite3.connect(uri, uri=True)
-cur = conn.cursor()
-tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
-out = []
-for (tname,) in tables:
-    safe_ident = tname.replace('"', '""')
-    cols = cur.execute(f'PRAGMA table_info("{safe_ident}")').fetchall()
-    idxs = cur.execute(f'PRAGMA index_list("{safe_ident}")').fetchall()
-    out.append({
-        "tableName": str(tname)[:80],
-        "columns": [{"name": str(c[1])[:80], "declaredType": str(c[2] or "ANY")[:40]} for c in cols],
-        "indexNames": [str(ix[1])[:80] for ix in idxs],
-    })
-conn.close()
-print(json.dumps(out))
+exp_dev = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "" else None
+exp_ino = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else None
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+fd = os.open(p, flags)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        sys.exit(11)
+    if exp_dev is not None and st.st_dev != exp_dev:
+        sys.exit(12)
+    if exp_ino is not None and st.st_ino != exp_ino:
+        sys.exit(13)
+    fd_path = f"/proc/self/fd/{fd}"
+    if os.path.exists(fd_path):
+        uri = f"file:{fd_path}?mode=ro&immutable=1"
+    else:
+        uri = "file:" + urllib.parse.quote(p) + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    cur = conn.cursor()
+    tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+    out = []
+    for (tname,) in tables:
+        safe_ident = tname.replace('"', '""')
+        cols = cur.execute(f'PRAGMA table_info("{safe_ident}")').fetchall()
+        idxs = cur.execute(f'PRAGMA index_list("{safe_ident}")').fetchall()
+        out.append({
+            "tableName": str(tname)[:80],
+            "columns": [{"name": str(c[1])[:80], "declaredType": str(c[2] or "ANY")[:40]} for c in cols],
+            "indexNames": [str(ix[1])[:80] for ix in idxs],
+        })
+    conn.close()
+    print(json.dumps(out))
+finally:
+    os.close(fd)
 `.trim();
 
-    const stdout = execFileSync('python3', ['-c', pyScript, sqlitePath], {
+    const pyArgs = [
+      '-c',
+      pyScript,
+      sqlitePath,
+      expectedStat ? String(expectedStat.dev) : '',
+      expectedStat ? String(expectedStat.ino) : '',
+    ];
+
+    const stdout = execFileSync('python3', pyArgs, {
       encoding: 'utf8',
       timeout: 4000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -215,7 +450,8 @@ function classifyHeaderSignatureOnly(
   if (hasSubagentKeys) {
     return {
       ecosystem: 'antigravity',
-      hasExplicitEventTimestamps: headerSlice.includes('"timestamp"') || headerSlice.includes('"created_at"'),
+      hasExplicitEventTimestamps:
+        headerSlice.includes('"timestamp"') || headerSlice.includes('"created_at"'),
     };
   }
 
@@ -231,11 +467,14 @@ function classifyHeaderSignatureOnly(
 
   if (
     headerSlice.includes('"codex"') ||
-    (ext === '.jsonl' && headerSlice.includes('"call_id"') && headerSlice.includes('"type":"function_call"'))
+    (ext === '.jsonl' &&
+      headerSlice.includes('"call_id"') &&
+      headerSlice.includes('"type":"function_call"'))
   ) {
     return {
       ecosystem: 'codex_cli',
-      hasExplicitEventTimestamps: headerSlice.includes('"timestamp"') || headerSlice.includes('"created_at"'),
+      hasExplicitEventTimestamps:
+        headerSlice.includes('"timestamp"') || headerSlice.includes('"created_at"'),
     };
   }
 
@@ -266,7 +505,8 @@ function classifyHeaderSignatureOnly(
   if (headerSlice.includes('"reasoning_content"')) {
     return {
       ecosystem: 'deepseek',
-      hasExplicitEventTimestamps: headerSlice.includes('"inserted_at"') || headerSlice.includes('"created_at"'),
+      hasExplicitEventTimestamps:
+        headerSlice.includes('"inserted_at"') || headerSlice.includes('"created_at"'),
     };
   }
 
@@ -299,16 +539,109 @@ function classifyHeaderSignatureOnly(
 
 function binaryExistsInPath(binName: string): boolean {
   try {
-    execFileSync('which', [binName], { stdio: 'ignore', timeout: 1500 });
+    const checker = process.platform === 'win32' ? 'where' : 'which';
+    execFileSync(checker, [binName], { stdio: 'ignore', timeout: 1500 });
     return true;
   } catch {
     return false;
   }
 }
 
+function probeNvidiaGpus(): SanitizedStage0Report['hostProfile']['gpuSummary'] {
+  try {
+    const out = execFileSync(
+      'nvidia-smi',
+      ['--query-gpu=name,memory.total,memory.free', '--format=csv,noheader,nounits'],
+      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    const devices = out
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        const [name, total, free] = line.split(',').map((s) => s.trim());
+        return {
+          modelCode: String(name || 'GPU').slice(0, 64),
+          vramTotalMb: Number(total) || 0,
+          vramFreeMb: Number(free) || 0,
+        };
+      });
+    return {
+      detectionState: devices.length > 0 ? 'DETECTED' : 'NONE_DETECTED',
+      devices,
+    };
+  } catch {
+    return { detectionState: 'NONE_DETECTED', devices: [] };
+  }
+}
+
+/**
+ * Safely writes the already-sanitized Stage 0 report strictly into Zone B without following
+ * a symlink at the destination filename.
+ */
+function writeZoneBReportNoFollow(zoneBOutputDir: string, serializedReportJson: string): string {
+  if (fs.existsSync(zoneBOutputDir)) {
+    const dirSt = fs.lstatSync(zoneBOutputDir);
+    if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_FS',
+        'ZONE_B_OUTPUT_DIR_SYMLINK_OR_NON_DIR',
+        'Refusing to write Stage 0 report: Zone B output directory is a symlink or non-directory.'
+      );
+    }
+  } else {
+    fs.mkdirSync(zoneBOutputDir, { recursive: true });
+  }
+
+  const outPath = path.join(zoneBOutputDir, 'stage0-sanitized-report.json');
+  const fsConsts = fs.constants as Record<string, number>;
+  const writeFlags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_TRUNC |
+    (fs.constants.O_NOFOLLOW ?? 0) |
+    (fsConsts.O_CLOEXEC ?? 0);
+
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(outPath, writeFlags, 0o600);
+    const fst = fs.fstatSync(fd);
+    if (!fst.isFile() || fst.nlink > 1) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_FS',
+        'ZONE_B_REPORT_TARGET_UNSAFE',
+        'Refusing to write Stage 0 report to non-regular or hardlinked target in Zone B.'
+      );
+    }
+    fs.writeFileSync(fd, serializedReportJson, 'utf8');
+  } catch (err) {
+    if (err instanceof Stage0FailClosedError) throw err;
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_FS',
+      'ZONE_B_REPORT_WRITE_FAILED',
+      `Failed to write sanitized Stage 0 report to Zone B: ${err instanceof Error ? err.message : 'unknown error'}`
+    );
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return outPath;
+}
+
 export interface ExecuteStage0Options {
   config: Stage0Config;
   manifestRawJson: string;
+  /**
+   * Independently trusted 64-character hex SHA-256 digest of the external 86 manifest.
+   * Required (either here or via config.expectedExternal86ManifestSha256). If both are provided,
+   * BOTH must match the manifest bytes via timing-safe comparison.
+   */
+  expectedManifestSha256?: string;
   evidenceOrigin: SanitizedStage0Report['evidenceOrigin'];
   canaryResults?: MultiIdentityCanaryResult[];
   writeReportFileToZoneB?: boolean;
@@ -327,7 +660,21 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
     openedPaths: [],
   };
 
-  // Precondition Step 1: Parse & hash external 86 manifest BEFORE touching scan roots
+  // Precondition Step 1: Authenticate external 86 manifest SHA-256 against an independently
+  // trusted expected digest BEFORE parsing the manifest or touching any scan root.
+  const primaryExpectedSha256 =
+    options.expectedManifestSha256 ?? options.config?.expectedExternal86ManifestSha256;
+  const secondaryExpectedSha256 =
+    options.expectedManifestSha256 && options.config?.expectedExternal86ManifestSha256
+      ? options.config.expectedExternal86ManifestSha256
+      : undefined;
+
+  const manifestSha256 = verifyManifestSha256(
+    options.manifestRawJson,
+    primaryExpectedSha256,
+    secondaryExpectedSha256
+  );
+
   let manifest: External86Manifest;
   try {
     manifest = JSON.parse(options.manifestRawJson) as External86Manifest;
@@ -338,10 +685,6 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       'External 86 manifest is not valid JSON; failing closed before traversal.'
     );
   }
-  const manifestSha256 = crypto
-    .createHash('sha256')
-    .update(options.manifestRawJson, 'utf8')
-    .digest('hex');
 
   // Precondition Step 2: Validate scan_roots_allowlist, Zone B disjointness, and 86 rules
   const { normalizedRoots } = validateStage0Preconditions(options.config, manifest);
@@ -354,6 +697,9 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
   );
   const hasConversationLevel86Rules = manifest.rules.some(
     (r) => r.kind === 'REVOKED_CONVERSATION_ID'
+  );
+  const hasArchiveEntry86Rules = manifest.rules.some(
+    (r) => r.kind === 'ARCHIVE_ENTRY_NAME'
   );
 
   const pruned86ByRuleId: Record<string, number> = {};
@@ -396,7 +742,7 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
     });
   }
 
-  // Step 3: Walk ONLY allowlisted roots using lstat (no-follow)
+  // Step 3: Walk ONLY allowlisted roots using lstat + O_NOFOLLOW + fstat verification
   for (const root of normalizedRoots) {
     telemetry.lstatCalls += 1;
     let rootStat: fs.Stats;
@@ -413,6 +759,14 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       continue;
     }
 
+    let rootRealPath: string;
+    try {
+      rootRealPath = fs.realpathSync(root.absolutePath);
+    } catch {
+      failClosedUncertainCount += 1;
+      continue;
+    }
+
     const rootDirDev = rootStat.dev;
     // Also inspect /proc/self/mountinfo on Linux to catch both directory and single-file bind mounts
     // without false positives on overlayfs (where upperdir files and overlay dirs have distinct st_dev).
@@ -420,9 +774,7 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
     try {
       if (fs.existsSync('/proc/self/mountinfo')) {
         const minfo = fs.readFileSync('/proc/self/mountinfo', 'utf8');
-        const rootPrefix = root.absolutePath.endsWith('/')
-          ? root.absolutePath
-          : root.absolutePath + '/';
+        const rootPrefix = rootRealPath.endsWith('/') ? rootRealPath : `${rootRealPath}/`;
         for (const line of minfo.split('\n')) {
           const parts = line.split(' ');
           if (parts.length >= 5) {
@@ -455,6 +807,26 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
         continue;
       }
 
+      // Verify directory handle with O_DIRECTORY | O_NOFOLLOW before readdir
+      const dirStatus = verifyDirectoryNoFollow({
+        dirPath: currentDir,
+        rootRealPath,
+        rootDirDev,
+        submountPaths,
+      });
+      if (dirStatus === 'SYMLINK') {
+        reparseOrSymlinkSkippedCount += 1;
+        continue;
+      }
+      if (dirStatus === 'MOUNT_CROSSING') {
+        mountCrossingSkippedCount += 1;
+        continue;
+      }
+      if (dirStatus === 'ERROR') {
+        failClosedUncertainCount += 1;
+        continue;
+      }
+
       let entries: string[];
       try {
         telemetry.readdirCalls += 1;
@@ -468,7 +840,7 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       for (const entryName of entries) {
         const fullPath = path.join(currentDir, entryName);
 
-        // Stage-0 Barrier Step A: Path/name/glob/mixed-container check BEFORE lstat/open
+        // Stage-0 Barrier Step A: Path/name/glob/conv-id/mixed-container check BEFORE lstat/open
         const nameGate = evaluatePreOpen86Rules({
           candidatePath: fullPath,
           entryName,
@@ -554,14 +926,36 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
           continue;
         }
 
-        // Mixed-Container Rule 1: ZIP archives — inspect Central Directory headers ONLY
+        // Mixed-Container Rule 1: ZIP archives — inspect Central Directory headers ONLY via verified O_NOFOLLOW fd
         if (ext === '.zip') {
-          let fd: number | null = null;
+          telemetry.openCalls += 1;
+          telemetry.openedPaths.push(fullPath);
+          const opened = openRegularFileNoFollowVerified({
+            fullPath,
+            entryName,
+            expectedStat: st,
+            rootRealPath,
+            mode: root.expectedFsMode,
+            ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
+            revokedPosixDevInos,
+            rules: manifest.rules,
+          });
+          if (!opened.ok) {
+            if (opened.reason === 'SYMLINK_RACE') reparseOrSymlinkSkippedCount += 1;
+            else if (opened.reason === 'HARDLINK_RACE') hardlinkAliasBlockedCount += 1;
+            else if (opened.reason === 'REVOKED_INODE_RACE' || opened.reason === 'PATH_OR_RULE_RACE') {
+              record86Hit(opened.matchedRuleId ?? 'R86_RACE_HIT');
+            } else {
+              failClosedUncertainCount += 1;
+            }
+            continue;
+          }
           try {
-            telemetry.openCalls += 1;
-            telemetry.openedPaths.push(fullPath);
-            fd = fs.openSync(fullPath, fs.constants.O_RDONLY);
-            const zipRes = inspectZipCentralDirectoryHeadersOnly(fd, st.size, manifest);
+            const zipRes = inspectZipCentralDirectoryHeadersOnly(
+              opened.fd,
+              opened.fstat.size,
+              manifest
+            );
             if (zipRes.status === 'MIXED_OR_UNCERTAIN_QUARANTINED') {
               mixedContainerQuarantinedCount += 1;
               if (zipRes.matchedRuleId) {
@@ -571,19 +965,31 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
           } catch {
             failClosedUncertainCount += 1;
           } finally {
-            if (fd !== null) fs.closeSync(fd);
+            fs.closeSync(opened.fd);
           }
           continue;
         }
 
-        // Mixed-Container Rule 2: SQLite ledgers — immutable DDL inspection ONLY (zero row reads)
+        // Mixed-Container Rule 1b: Non-ZIP archives cannot be TOC-checked header-only -> quarantine unscanned
+        if (UNSCANNABLE_ARCHIVE_EXTS.has(ext) && (hasConversationLevel86Rules || hasArchiveEntry86Rules)) {
+          potentialMixedUnscannedCount += 1;
+          continue;
+        }
+
+        // Mixed-Container Rule 2: SQLite ledgers
+        // When conversation-level 86 rules exist, fail closed and quarantine UNSCANNED (zero opens, zero DDL reads).
+        // Only when no conversation-level 86 rules exist, inspect immutable read-only DDL via TOCTOU-verified fd.
         if (ext === '.sqlite' || ext === '.sqlite3' || ext === '.db') {
           if (hasConversationLevel86Rules) {
             potentialMixedUnscannedCount += 1;
+            continue;
           }
           const alias = `LEDGER_${String(sqliteIdx).padStart(2, '0')}`;
           sqliteIdx += 1;
-          const ddl = inspectSqliteSchemaImmutableReadOnly(fullPath, alias);
+          const ddl = inspectSqliteSchemaImmutableReadOnly(fullPath, alias, {
+            dev: st.dev,
+            ino: st.ino,
+          });
           if (ddl === null) {
             failClosedUncertainCount += 1;
           } else {
@@ -605,21 +1011,40 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
           continue;
         }
 
-        // Cleared structured JSON / JSONL file: read <= 2048-byte header slice ONLY for structural keys
+        // Cleared structured JSON / JSONL file: open with O_NOFOLLOW + fstat verification,
+        // then read <= 2048-byte header slice ONLY for structural keys.
         if (ext === '.json' || ext === '.jsonl') {
-          let fd: number | null = null;
+          telemetry.openCalls += 1;
+          telemetry.openedPaths.push(fullPath);
+          const opened = openRegularFileNoFollowVerified({
+            fullPath,
+            entryName,
+            expectedStat: st,
+            rootRealPath,
+            mode: root.expectedFsMode,
+            ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
+            revokedPosixDevInos,
+            rules: manifest.rules,
+          });
+          if (!opened.ok) {
+            if (opened.reason === 'SYMLINK_RACE') reparseOrSymlinkSkippedCount += 1;
+            else if (opened.reason === 'HARDLINK_RACE') hardlinkAliasBlockedCount += 1;
+            else if (opened.reason === 'REVOKED_INODE_RACE' || opened.reason === 'PATH_OR_RULE_RACE') {
+              record86Hit(opened.matchedRuleId ?? 'R86_RACE_HIT');
+            } else {
+              failClosedUncertainCount += 1;
+            }
+            continue;
+          }
           try {
-            telemetry.openCalls += 1;
-            telemetry.openedPaths.push(fullPath);
-            fd = fs.openSync(fullPath, fs.constants.O_RDONLY);
-            const sliceLen = Math.min(st.size, 2048);
+            const sliceLen = Math.min(opened.fstat.size, 2048);
             const buf = Buffer.alloc(sliceLen);
-            const readBytes = fs.readSync(fd, buf, 0, sliceLen, 0);
+            const readBytes = fs.readSync(opened.fd, buf, 0, sliceLen, 0);
             const headerStr = buf.subarray(0, readBytes).toString('utf8');
             const sig = classifyHeaderSignatureOnly(headerStr, ext);
             const bucket = formatMap.get(sig.ecosystem)!;
             bucket.files += 1;
-            bucket.bytes += st.size;
+            bucket.bytes += opened.fstat.size;
             bucket.containers += 1;
             if (sig.hasExplicitEventTimestamps !== 'UNKNOWN') {
               bucket.hasTimestamps = sig.hasExplicitEventTimestamps;
@@ -627,17 +1052,26 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
           } catch {
             failClosedUncertainCount += 1;
           } finally {
-            if (fd !== null) fs.closeSync(fd);
+            fs.closeSync(opened.fd);
           }
         }
       }
     }
   }
 
-  // Probe optional Universal Harness paths (existence & entrypoint count only, read-only)
+  // Probe optional Universal Harness paths (existence & entrypoint count only, read-only, 86-checked)
   let universalHarnessDetected = false;
   let universalHarnessEntrypointsCount = 0;
   for (const hp of options.config.universalHarnessProbePaths ?? []) {
+    const preCheck = evaluatePreOpen86Rules({
+      candidatePath: hp,
+      entryName: path.basename(hp),
+      mode: options.config.hostOsMode,
+      rules: manifest.rules,
+    });
+    if (preCheck.matched) {
+      continue;
+    }
     try {
       const hStat = fs.lstatSync(hp);
       if (!hStat.isSymbolicLink() && (hStat.isDirectory() || hStat.isFile())) {
@@ -685,10 +1119,7 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       cpuCores: os.cpus().length,
       totalMemBytes: os.totalmem(),
       freeMemBytes: os.freemem(),
-      gpuSummary: {
-        detectionState: binaryExistsInPath('nvidia-smi') ? 'DETECTED' : 'NONE_DETECTED',
-        devices: [],
-      },
+      gpuSummary: probeNvidiaGpus(),
       llamaCppStatus: {
         serverBinaryPresent: binaryExistsInPath('llama-server'),
         cliBinaryPresent: binaryExistsInPath('llama-cli'),
@@ -705,6 +1136,7 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       allowlistRootCount: normalizedRoots.length,
       manifestId: manifest.manifestId,
       manifestSha256,
+      manifestIntegrityVerified: true,
       pruned86ByRuleId,
       reparseOrSymlinkSkippedCount,
       mountCrossingSkippedCount,
@@ -725,17 +1157,15 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
     formatInventory,
   };
 
-  // Pre-emit zero-leak sanitization check
+  // Pre-emit zero-leak sanitization check (authoritative across both sandbox and exported workstation runner)
   const serializedReportJson = assertSanitizedStage0Report(report);
 
   let writtenReportPath: string | undefined;
   if (options.writeReportFileToZoneB) {
-    fs.mkdirSync(options.config.zoneBOutputDir, { recursive: true });
-    writtenReportPath = path.join(
+    writtenReportPath = writeZoneBReportNoFollow(
       options.config.zoneBOutputDir,
-      'stage0-sanitized-report.json'
+      serializedReportJson
     );
-    fs.writeFileSync(writtenReportPath, serializedReportJson, 'utf8');
   }
 
   return {

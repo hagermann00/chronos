@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import path from 'node:path';
 import type {
   External86Manifest,
@@ -345,6 +346,80 @@ export function classifyWin32AttributesAndReparse(
   };
 }
 
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/i;
+
+/**
+ * Verifies the raw external 86 manifest bytes against an independently supplied trusted SHA-256
+ * digest BEFORE parsing or relying on any manifest rules. Fails closed if missing, malformed,
+ * or mismatched. If two independent digests are supplied (e.g., CLI flag + config pin), BOTH
+ * must match the computed digest.
+ */
+export function verifyManifestSha256(
+  manifestRawJson: string,
+  expectedSha256: string | null | undefined,
+  secondaryExpectedSha256?: string | null
+): string {
+  if (typeof manifestRawJson !== 'string' || manifestRawJson.length === 0) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      'EMPTY_MANIFEST_PAYLOAD',
+      'External 86 manifest content is empty; failing closed before traversal.'
+    );
+  }
+
+  const primary = typeof expectedSha256 === 'string' ? expectedSha256.trim().toLowerCase() : '';
+  if (!primary) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      'MISSING_EXPECTED_MANIFEST_SHA256',
+      'An independently trusted expected SHA-256 digest is required to authenticate the external 86 manifest.'
+    );
+  }
+  if (!SHA256_HEX_RE.test(primary)) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      'INVALID_EXPECTED_MANIFEST_SHA256_FORMAT',
+      'Expected external 86 manifest SHA-256 must be a 64-character hexadecimal string.'
+    );
+  }
+
+  const computedHex = crypto
+    .createHash('sha256')
+    .update(manifestRawJson, 'utf8')
+    .digest('hex');
+  const computedBuf = Buffer.from(computedHex, 'hex');
+  const primaryBuf = Buffer.from(primary, 'hex');
+
+  if (!crypto.timingSafeEqual(computedBuf, primaryBuf)) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      'MANIFEST_SHA256_MISMATCH',
+      'External 86 manifest SHA-256 does not match the independently trusted expected digest; refusing to traverse.'
+    );
+  }
+
+  if (secondaryExpectedSha256 !== undefined && secondaryExpectedSha256 !== null && secondaryExpectedSha256 !== '') {
+    const secondary = secondaryExpectedSha256.trim().toLowerCase();
+    if (!SHA256_HEX_RE.test(secondary)) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_86_INIT',
+        'INVALID_EXPECTED_MANIFEST_SHA256_FORMAT',
+        'Secondary expected external 86 manifest SHA-256 must be a 64-character hexadecimal string.'
+      );
+    }
+    const secondaryBuf = Buffer.from(secondary, 'hex');
+    if (!crypto.timingSafeEqual(computedBuf, secondaryBuf)) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_86_INIT',
+        'MANIFEST_SHA256_MISMATCH',
+        'External 86 manifest SHA-256 disagrees with secondary trusted digest; refusing to traverse.'
+      );
+    }
+  }
+
+  return computedHex;
+}
+
 /**
  * Validates Stage 0 Config & External 86 Manifest BEFORE any filesystem traversal.
  * Fails closed immediately on empty roots, invalid paths, Zone A / Zone B overlap,
@@ -373,6 +448,26 @@ export function validateStage0Preconditions(
       'FAIL_CLOSED_CONFIG',
       'EMPTY_SCAN_ROOTS_ALLOWLIST',
       'Owner-approved scanRootsAllowlist must contain at least one explicit absolute directory.'
+    );
+  }
+
+  const manifestPathRes = normalizePathByMode(config.external86ManifestPath, config.hostOsMode);
+  if (!manifestPathRes.ok) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      `INVALID_86_MANIFEST_PATH:${manifestPathRes.hazardReason}`,
+      `External 86 manifest path failed validation: ${manifestPathRes.hazardReason}`
+    );
+  }
+
+  if (
+    config.expectedExternal86ManifestSha256 !== undefined &&
+    !SHA256_HEX_RE.test(config.expectedExternal86ManifestSha256.trim())
+  ) {
+    throw new Stage0FailClosedError(
+      'FAIL_CLOSED_86_INIT',
+      'INVALID_EXPECTED_MANIFEST_SHA256_FORMAT',
+      'Configured expectedExternal86ManifestSha256 must be a valid 64-character hex digest.'
     );
   }
 
@@ -407,6 +502,37 @@ export function validateStage0Preconditions(
       'UNAPPROVED_EMPTY_86_RULESET',
       'External 86 manifest has zero rules without explicit allowEmptyRuleset=true sign-off.'
     );
+  }
+
+  if (config.canaryAgentIdentities !== undefined) {
+    if (!Array.isArray(config.canaryAgentIdentities)) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_CONFIG',
+        'MALFORMED_CANARY_IDENTITIES',
+        'canaryAgentIdentities must be an array when specified.'
+      );
+    }
+    const validPrincipalKinds = new Set([
+      'INTERACTIVE_OWNER',
+      'CLI_AGENT_SAME_UID',
+      'ISOLATED_AGENT_UID',
+      'SEARCH_SUBPROCESS',
+    ]);
+    for (const identity of config.canaryAgentIdentities) {
+      if (
+        !identity ||
+        !identity.identityLabel ||
+        !validPrincipalKinds.has(identity.principalKind) ||
+        (identity.expectedAccess !== 'MUST_DENY' &&
+          identity.expectedAccess !== 'DIAGNOSTIC_EXPOSURE_CHECK')
+      ) {
+        throw new Stage0FailClosedError(
+          'FAIL_CLOSED_CONFIG',
+          'INVALID_CANARY_IDENTITY_ENTRY',
+          'Each canaryAgentIdentities entry must declare identityLabel, principalKind, and expectedAccess.'
+        );
+      }
+    }
   }
 
   const seenAliases = new Set<string>();
@@ -554,6 +680,14 @@ export function evaluatePreOpen86Rules(params: {
       if (params.ntfsFileId128.toLowerCase() === rule.targetValue.toLowerCase()) {
         return { matched: true, ruleId: rule.ruleId, matchedKind: rule.kind };
       }
+    } else if (rule.kind === 'REVOKED_CONVERSATION_ID') {
+      const targetId = caseInsensitive ? rule.targetValue.toLowerCase() : rule.targetValue;
+      if (
+        entryComp.includes(targetId) ||
+        normCandidate.canonicalComparisonKey.includes(targetId)
+      ) {
+        return { matched: true, ruleId: rule.ruleId, matchedKind: rule.kind };
+      }
     }
   }
 
@@ -564,21 +698,25 @@ export function matchArchiveEntryAgainst86(
   archiveEntryPath: string,
   rules: Rule86Entry[]
 ): { matched: boolean; ruleId?: string } {
-  const base = path.posix.basename(archiveEntryPath.replace(/\\/g, '/'));
+  const normalizedEntry = archiveEntryPath.replace(/\\/g, '/');
+  const segments = normalizedEntry.split('/').filter(Boolean);
+  const base = path.posix.basename(normalizedEntry);
   for (const rule of rules) {
     if (rule.kind === 'ARCHIVE_ENTRY_NAME' || rule.kind === 'FILENAME_EXACT') {
+      const lowerTarget = rule.targetValue.toLowerCase();
       if (
-        archiveEntryPath.toLowerCase().includes(rule.targetValue.toLowerCase()) ||
-        base.toLowerCase() === rule.targetValue.toLowerCase()
+        normalizedEntry.toLowerCase().includes(lowerTarget) ||
+        base.toLowerCase() === lowerTarget ||
+        segments.some((seg) => seg.toLowerCase() === lowerTarget)
       ) {
         return { matched: true, ruleId: rule.ruleId };
       }
     } else if (rule.kind === 'GLOB_SEGMENT') {
-      if (matchSimpleGlobSegment(base, rule.targetValue, true)) {
+      if (segments.some((seg) => matchSimpleGlobSegment(seg, rule.targetValue, true))) {
         return { matched: true, ruleId: rule.ruleId };
       }
     } else if (rule.kind === 'REVOKED_CONVERSATION_ID') {
-      if (archiveEntryPath.includes(rule.targetValue)) {
+      if (normalizedEntry.toLowerCase().includes(rule.targetValue.toLowerCase())) {
         return { matched: true, ruleId: rule.ruleId };
       }
     }

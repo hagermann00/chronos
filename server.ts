@@ -52,7 +52,7 @@ async function startServer() {
         manifest: External86Manifest;
       };
       const validated = validateStage0Preconditions(config, manifest);
-      const scripts = generateWorkstationStage0Scripts(config);
+      const scripts = generateWorkstationStage0Scripts(config, manifest);
       res.json({
         ok: true,
         normalizedRootCount: validated.normalizedRoots.length,
