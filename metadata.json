@@ -2,5 +2,7 @@
   "name": "Chronos Ledger",
   "description": "Deployment-agnostic multi-vendor conversation ingestion specification and Stage 0 read-only security, reuse, and corpus assessment workbench.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
