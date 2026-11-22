@@ -1,8 +1,13 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runIsolatedCanaryAccessTests } from './canaryHarness.ts';
+import {
+  evaluateCanaryIsolationGate,
+  generateWorkstationStage0Scripts,
+  runIsolatedCanaryAccessTests,
+} from './canaryHarness.ts';
 import { Stage0FailClosedError } from './pathSecurity.ts';
 import { auditSanitizedStage0Report } from './sanitizer.ts';
 import { executeStage0Discovery } from './traversalEngine.ts';
@@ -77,29 +82,59 @@ export interface SandboxVerificationSummary {
   generatedReport: SanitizedStage0Report;
 }
 
+function sha256Hex(raw: string): string {
+  return crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
 /**
  * Runs a complete, real-syscall Stage 0 verification pass inside a disposable /tmp directory,
- * proving pre-open 86 pruning, symlink/hardlink blocking, mixed-ZIP quarantine, SQLite Zone A
- * zero-sidecar immutability, multi-identity canary checks, and zero-leak output sanitization.
+ * proving:
+ * - Precondition fail-closed (allowlist, manifest SHA-256 authentication)
+ * - Pre-open 86 pruning across PATH_PREFIX, POSIX_DEV_INO, FILENAME_EXACT, GLOB_SEGMENT,
+ *   ARCHIVE_ENTRY_NAME, REVOKED_CONVERSATION_ID, and KNOWN_MIXED_CONTAINER
+ * - Symlink & hardlink blocking + O_NOFOLLOW/fstat TOCTOU enforcement
+ * - Mixed-ZIP TOC quarantine AND SQLite quarantine when conversation-level 86 rules exist
+ * - SQLite Zone A zero-sidecar immutability when no conversation-level 86 rules apply
+ * - Strict multi-identity canary isolation enforcement (requiring every protected identity denied)
+ * - Independent subprocess execution of the ACTUAL exported workstation scripts in /tmp with
+ *   exact security parity against the authoritative engine
+ * - Zero-leak output sanitization
  */
 export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
   const scratchBase = fs.mkdtempSync(path.join(os.tmpdir(), 'chronos-stage0-sandbox-'));
   const zoneARoot = path.join(scratchBase, 'zone_a_scan_root');
   const zoneBOut = path.join(scratchBase, 'zone_b_authorized_output');
+  const zoneBExportedRunnerOut = path.join(scratchBase, 'zone_b_exported_runner_output');
   const outsideSecretDir = path.join(scratchBase, 'outside_86_secret_vault');
+  const exportedScriptsDir = path.join(scratchBase, 'standalone_exported_scripts');
 
   const checks: SandboxVerificationCheck[] = [];
 
   try {
     fs.mkdirSync(zoneARoot, { recursive: true });
     fs.mkdirSync(zoneBOut, { recursive: true });
+    fs.mkdirSync(zoneBExportedRunnerOut, { recursive: true });
     fs.mkdirSync(outsideSecretDir, { recursive: true });
+    fs.mkdirSync(exportedScriptsDir, { recursive: true });
 
     // 1. Create an 86'd subdirectory inside Zone A (must NEVER be opened)
     const revokedSubdir = path.join(zoneARoot, 'revoked_client_alpha');
     fs.mkdirSync(revokedSubdir, { recursive: true });
     const revokedSecretFile = path.join(revokedSubdir, 'do_not_open.json');
     fs.writeFileSync(revokedSecretFile, '{"secret":"sk-live1234567890abcdefghijklmnop"}');
+
+    // 1b. Additional 86 fixtures exercising FILENAME_EXACT, GLOB_SEGMENT, REVOKED_CONVERSATION_ID, KNOWN_MIXED_CONTAINER
+    const exactRevokedFile = path.join(zoneARoot, 'exact_revoked_creds.json');
+    fs.writeFileSync(exactRevokedFile, '{"secret":"exact_filename_revoked"}');
+
+    const globRevokedFile = path.join(zoneARoot, 'audit_private_86_draft.json');
+    fs.writeFileSync(globRevokedFile, '{"secret":"glob_segment_revoked"}');
+
+    const convIdFile = path.join(zoneARoot, 'session_conv_86_revoked.json');
+    fs.writeFileSync(convIdFile, '{"secret":"revoked_conv_id_file"}');
+
+    const knownMixedContainerFile = path.join(zoneARoot, 'known_mixed_dump.json');
+    fs.writeFileSync(knownMixedContainerFile, '{"mixed":true}');
 
     // 2. Create a symlink attempting to escape Zone A into outsideSecretDir
     const outsideTarget = path.join(outsideSecretDir, 'escaped.json');
@@ -130,7 +165,7 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       '[{"id":"conv_ok","mapping":{},"current_node":"1"},{"id":"conv_86_revoked","mapping":{},"current_node":"2"}]'
     );
 
-    // 6. Create a real SQLite ledger in Zone A via python3 sqlite3 to verify zero -wal/-shm sidecars
+    // 6. Create a real SQLite ledger in Zone A via python3 sqlite3 to verify quarantine & immutability
     const sqliteDir = path.join(zoneARoot, 'existing_ledger');
     fs.mkdirSync(sqliteDir, { recursive: true });
     const sqlitePath = path.join(sqliteDir, 'harness_jobs.sqlite');
@@ -146,7 +181,7 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
     const sqliteDirBefore = fs.readdirSync(sqliteDir).sort();
     const sqliteHashBefore = fs.readFileSync(sqlitePath);
 
-    // 7. Create cleared structured session files (Antigravity, Gemini CLI, Codex CLI, Claude Code)
+    // 7. Create cleared structured session files (Antigravity, Gemini CLI, Claude Code)
     const cleanDir = path.join(zoneARoot, 'active_sessions');
     fs.mkdirSync(cleanDir, { recursive: true });
     fs.writeFileSync(
@@ -189,6 +224,24 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
           reasonCode: 'OWNER_REVOKED_CLIENT',
         },
         {
+          ruleId: 'R86_EXACT_FILE',
+          kind: 'FILENAME_EXACT',
+          targetValue: 'exact_revoked_creds.json',
+          reasonCode: 'OWNER_REVOKED_EXACT_FILE',
+        },
+        {
+          ruleId: 'R86_GLOB_PRIVATE',
+          kind: 'GLOB_SEGMENT',
+          targetValue: '*private_86*',
+          reasonCode: 'OWNER_REVOKED_GLOB',
+        },
+        {
+          ruleId: 'R86_KNOWN_MIXED',
+          kind: 'KNOWN_MIXED_CONTAINER',
+          targetValue: knownMixedContainerFile,
+          reasonCode: 'KNOWN_MIXED_DUMP',
+        },
+        {
           ruleId: 'R86_INODE_GUARD',
           kind: 'POSIX_DEV_INO',
           targetValue: revokedDevIno,
@@ -209,6 +262,11 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       ],
     };
 
+    const manifestRawJson = JSON.stringify(manifest, null, 2);
+    const trustedManifestSha256 = sha256Hex(manifestRawJson);
+    const manifestPath = path.join(zoneBOut, 'manifest.json');
+    fs.writeFileSync(manifestPath, manifestRawJson, 'utf8');
+
     const config: Stage0Config = {
       configVersion: '1.0.0',
       hostOsMode: 'POSIX',
@@ -219,7 +277,7 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
           expectedFsMode: 'POSIX',
         },
       ],
-      external86ManifestPath: path.join(zoneBOut, 'manifest.json'),
+      external86ManifestPath: manifestPath,
       zoneBOutputDir: zoneBOut,
       workflowWeights: {
         antigravity: 'CRITICAL_ACTIVE_WORK',
@@ -241,7 +299,8 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
     try {
       executeStage0Discovery({
         config: { ...config, scanRootsAllowlist: [] },
-        manifestRawJson: JSON.stringify(manifest),
+        manifestRawJson,
+        expectedManifestSha256: trustedManifestSha256,
         evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
       });
     } catch (err) {
@@ -257,21 +316,103 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
         : 'Unexpectedly continued with empty allowlist.',
     });
 
-    // Check B: Run Multi-Identity Canary Access Tests in isolated scratch dir
-    const canaryResults = runIsolatedCanaryAccessTests(path.join(zoneBOut, 'canary_runs'));
+    // Check B: Fail-closed when expected manifest SHA-256 is missing or mismatched
+    let missingDigestBlocked = false;
+    try {
+      executeStage0Discovery({
+        config,
+        manifestRawJson,
+        evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+      });
+    } catch (err) {
+      missingDigestBlocked =
+        err instanceof Stage0FailClosedError &&
+        err.code === 'FAIL_CLOSED_86_INIT' &&
+        err.detailCode === 'MISSING_EXPECTED_MANIFEST_SHA256';
+    }
+
+    let wrongDigestBlocked = false;
+    try {
+      executeStage0Discovery({
+        config,
+        manifestRawJson,
+        expectedManifestSha256: '0'.repeat(64),
+        evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+      });
+    } catch (err) {
+      wrongDigestBlocked =
+        err instanceof Stage0FailClosedError &&
+        err.code === 'FAIL_CLOSED_86_INIT' &&
+        err.detailCode === 'MANIFEST_SHA256_MISMATCH';
+    }
+
     checks.push({
-      checkId: 'MULTI_IDENTITY_CANARY_REAL_EXEC',
-      title: 'Real Subprocess Canary Access-Control Probes (Read / List / Grep)',
-      passed: canaryResults.length === 3,
-      measuredDetail: canaryResults
-        .map((c) => `${c.principalKind}: ${c.outcome}`)
-        .join(' · '),
+      checkId: 'MANIFEST_SHA256_AUTHENTICATED',
+      title: 'External 86 Manifest SHA-256 Verified Against Independently Trusted Digest',
+      passed: missingDigestBlocked && wrongDigestBlocked,
+      measuredDetail: `missingDigestBlocked=${missingDigestBlocked} · wrongDigestBlocked=${wrongDigestBlocked}`,
     });
 
-    // Check C: Execute full Stage 0 traversal on scratch Zone A
+    // Check C: Run Multi-Identity Canary Access Tests and enforce strict isolation gate
+    const canaryResults = runIsolatedCanaryAccessTests(path.join(zoneBOut, 'canary_runs'));
+    const canaryGate = evaluateCanaryIsolationGate(canaryResults);
+    const sameUidControlDetectedExposure = canaryResults.some(
+      (c) =>
+        c.principalKind === 'CLI_AGENT_SAME_UID' &&
+        c.outcome === 'FAIL_EXPOSED_TO_IDENTITY'
+    );
+
+    // Also generate and test the ACTUAL exported standalone canary script for fail-closed behavior
+    const exportedScripts = generateWorkstationStage0Scripts(config, manifest);
+    const exportedProbePath = path.join(exportedScriptsDir, 'stage0-workstation-probe.mjs');
+    const exportedCanaryPath = path.join(exportedScriptsDir, 'stage0-multi-identity-canary.mjs');
+    fs.writeFileSync(exportedProbePath, exportedScripts.probeScriptMjs, 'utf8');
+    fs.writeFileSync(exportedCanaryPath, exportedScripts.canaryScriptMjs, 'utf8');
+
+    // Verify exported canary refuses to silently substitute current user when a nonexistent agent user is requested
+    const canaryTestDir = path.join(zoneBOut, 'exported_canary_vault');
+    fs.mkdirSync(canaryTestDir, { recursive: true });
+    const fakeAgentRun = spawnSync(
+      process.execPath,
+      [
+        exportedCanaryPath,
+        '--vault-test-dir',
+        canaryTestDir,
+        '--agent-user',
+        'chronos_nonexistent_agent_999',
+      ],
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    let fakeAgentFailedClosed = false;
+    try {
+      const parsedFake = JSON.parse(fakeAgentRun.stdout || '{}') as {
+        allProtectedIdentitiesDenied?: boolean;
+        protectedIdentitiesUncertain?: number;
+      };
+      fakeAgentFailedClosed =
+        fakeAgentRun.status !== 0 &&
+        parsedFake.allProtectedIdentitiesDenied === false &&
+        parsedFake.protectedIdentitiesUncertain === 1;
+    } catch {
+      fakeAgentFailedClosed = false;
+    }
+
+    checks.push({
+      checkId: 'MULTI_IDENTITY_CANARY_STRICT_ENFORCEMENT',
+      title: 'Strict Multi-Identity Canary Gate (All Protected Identities Denied + Unverified User Fails Closed)',
+      passed:
+        canaryGate.allProtectedIdentitiesDenied &&
+        canaryGate.protectedIdentitiesTested === 2 &&
+        sameUidControlDetectedExposure &&
+        fakeAgentFailedClosed,
+      measuredDetail: `protectedDenied=${canaryGate.protectedIdentitiesDenied}/${canaryGate.protectedIdentitiesTested} · sameUidControlExposed=${sameUidControlDetectedExposure} · nonexistentAgentFailedClosed=${fakeAgentFailedClosed}`,
+    });
+
+    // Check D: Execute full Stage 0 traversal on scratch Zone A (with REVOKED_CONVERSATION_ID active)
     const { report, telemetry } = executeStage0Discovery({
       config,
-      manifestRawJson: JSON.stringify(manifest),
+      manifestRawJson,
+      expectedManifestSha256: trustedManifestSha256,
       evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
       canaryResults,
       writeReportFileToZoneB: true,
@@ -279,28 +420,58 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
 
     const neverOpenedRevokedOrLinks =
       !telemetry.openedPaths.includes(revokedSecretFile) &&
+      !telemetry.openedPaths.includes(exactRevokedFile) &&
+      !telemetry.openedPaths.includes(globRevokedFile) &&
+      !telemetry.openedPaths.includes(convIdFile) &&
+      !telemetry.openedPaths.includes(knownMixedContainerFile) &&
       !telemetry.openedPaths.includes(escapeSymlink) &&
       !telemetry.openedPaths.includes(outsideTarget) &&
       !telemetry.openedPaths.includes(hardlinkAlias) &&
-      !telemetry.openedPaths.includes(monoChatGptPath);
+      !telemetry.openedPaths.includes(monoChatGptPath) &&
+      !telemetry.openedPaths.includes(sqlitePath);
 
     checks.push({
       checkId: 'ZERO_OPEN_ON_86_SYMLINK_HARDLINK',
-      title: 'Zero open() Calls on 86 Subtree, Escape Symlink & Hardlink Alias',
+      title: 'Zero open() Calls on All 86 Rule Kinds, Escape Symlink, Hardlink Alias & Quarantined Containers',
       passed:
         neverOpenedRevokedOrLinks &&
         report.securityAudit.reparseOrSymlinkSkippedCount === 1 &&
-        report.securityAudit.hardlinkAliasBlockedCount === 1,
-      measuredDetail: `openedPaths=${telemetry.openedPaths.length} (clean files + ZIP TOC only) · symlinksSkipped=${report.securityAudit.reparseOrSymlinkSkippedCount} · hardlinkBlocked=${report.securityAudit.hardlinkAliasBlockedCount}`,
+        report.securityAudit.hardlinkAliasBlockedCount === 1 &&
+        report.securityAudit.pruned86ByRuleId['R86_SUBDIR_ALPHA'] === 1 &&
+        report.securityAudit.pruned86ByRuleId['R86_EXACT_FILE'] === 1 &&
+        report.securityAudit.pruned86ByRuleId['R86_GLOB_PRIVATE'] === 1 &&
+        report.securityAudit.pruned86ByRuleId['R86_CONV_ID'] === 1 &&
+        report.securityAudit.pruned86ByRuleId['R86_KNOWN_MIXED'] === 1,
+      measuredDetail: `openedPaths=${telemetry.openedPaths.length} (clean files + ZIP TOC only) · symlinksSkipped=${report.securityAudit.reparseOrSymlinkSkippedCount} · hardlinkBlocked=${report.securityAudit.hardlinkAliasBlockedCount} · rulesFired=${Object.keys(report.securityAudit.pruned86ByRuleId).length}`,
     });
 
+    // Check E: Mixed ZIP TOC + Monolithic JSON + SQLite Quarantine when REVOKED_CONVERSATION_ID rules exist
+    const sqliteQuarantinedUnderConv86 =
+      report.securityAudit.mixedContainerQuarantinedCount === 2 && // KNOWN_MIXED_CONTAINER + mixed ZIP
+      report.securityAudit.potentialMixedUnscannedCount === 2 && // conversations.json + SQLite
+      report.reuseInventory.sqliteLedgersInspected.length === 0;
+
     checks.push({
-      checkId: 'MIXED_ARCHIVE_SAFE_QUARANTINE',
-      title: 'Mixed ZIP Central-Directory & Monolithic Export Quarantine (Zero Payload Read)',
-      passed:
-        report.securityAudit.mixedContainerQuarantinedCount === 1 &&
-        report.securityAudit.potentialMixedUnscannedCount === 2,
-      measuredDetail: `mixedZipQuarantined=${report.securityAudit.mixedContainerQuarantinedCount} · potentialMixedUnscanned=${report.securityAudit.potentialMixedUnscannedCount} (conversations.json + SQLite)`,
+      checkId: 'MIXED_ARCHIVE_AND_SQLITE_QUARANTINE',
+      title: 'Mixed ZIP TOC, Monolithic JSON & SQLite Quarantined Unscanned Under Conversation-Level 86 Rules',
+      passed: sqliteQuarantinedUnderConv86,
+      measuredDetail: `mixedQuarantined=${report.securityAudit.mixedContainerQuarantinedCount} · potentialMixedUnscanned=${report.securityAudit.potentialMixedUnscannedCount} · sqliteDdlOpenedUnderConv86=${report.reuseInventory.sqliteLedgersInspected.length}`,
+    });
+
+    // Check F: When NO conversation-level 86 rules exist, SQLite immutable DDL inspection runs cleanly
+    // with zero -wal/-shm sidecars and zero byte mutations in Zone A
+    const noConvManifest: External86Manifest = {
+      ...manifest,
+      manifestId: 'MANIFEST_SANDBOX_NO_CONV_86',
+      rules: manifest.rules.filter((r) => r.kind !== 'REVOKED_CONVERSATION_ID'),
+    };
+    const noConvManifestRaw = JSON.stringify(noConvManifest, null, 2);
+    const noConvRun = executeStage0Discovery({
+      config,
+      manifestRawJson: noConvManifestRaw,
+      expectedManifestSha256: sha256Hex(noConvManifestRaw),
+      evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+      writeReportFileToZoneB: false,
     });
 
     const sqliteDirAfter = fs.readdirSync(sqliteDir).sort();
@@ -308,16 +479,92 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
     const zoneAUntouched =
       JSON.stringify(sqliteDirBefore) === JSON.stringify(sqliteDirAfter) &&
       Buffer.compare(sqliteHashBefore, sqliteHashAfter) === 0 &&
-      report.reuseInventory.sqliteLedgersInspected.length === 1;
+      noConvRun.report.reuseInventory.sqliteLedgersInspected.length === 1 &&
+      noConvRun.report.reuseInventory.sqliteLedgersInspected[0].tableName === 'closeout_sessions';
 
     checks.push({
       checkId: 'ZONE_A_SQLITE_IMMUTABILITY',
-      title: 'Zone A Read-Only SQLite DDL Inspection (Zero -wal/-shm Sidecars or Byte Mutations)',
+      title: 'Zone A Read-Only SQLite DDL Inspection When Cleared (Zero -wal/-shm Sidecars or Byte Mutations)',
       passed: zoneAUntouched,
-      measuredDetail: `Zone A files=${sqliteDirAfter.join(',')} · DDL tables=${report.reuseInventory.sqliteLedgersInspected.map((s) => s.tableName).join(',')} · Row payloads read=0`,
+      measuredDetail: `Zone A files=${sqliteDirAfter.join(',')} · DDL tables=${noConvRun.report.reuseInventory.sqliteLedgersInspected.map((s) => s.tableName).join(',')} · Row payloads read=0`,
     });
 
-    // Check D: Verify Zero-Leak Sanitizer rejects injected secret / raw path
+    // Check G: Independently execute the ACTUAL exported standalone workstation probe in /tmp
+    // (outside repo / zero node_modules) and verify fail-closed parity + identical sanitized output
+    const exportedConfigPath = path.join(zoneBExportedRunnerOut, 'stage0-config.json');
+    const exportedConfig: Stage0Config = {
+      ...config,
+      zoneBOutputDir: zoneBExportedRunnerOut,
+    };
+    fs.writeFileSync(exportedConfigPath, JSON.stringify(exportedConfig, null, 2), 'utf8');
+
+    // G1: Exported runner MUST fail closed without expected SHA-256
+    const probeMissingSha = spawnSync(
+      process.execPath,
+      [exportedProbePath, '--config', exportedConfigPath],
+      { encoding: 'utf8', cwd: exportedScriptsDir, timeout: 8000 }
+    );
+    // G2: Exported runner MUST fail closed with wrong SHA-256
+    const probeWrongSha = spawnSync(
+      process.execPath,
+      [exportedProbePath, '--config', exportedConfigPath, '--expected-manifest-sha256', 'f'.repeat(64)],
+      { encoding: 'utf8', cwd: exportedScriptsDir, timeout: 8000 }
+    );
+    // G3: Exported runner MUST succeed with valid trusted SHA-256 and match main engine parity
+    const probeValidRun = spawnSync(
+      process.execPath,
+      [
+        exportedProbePath,
+        '--config',
+        exportedConfigPath,
+        '--expected-manifest-sha256',
+        trustedManifestSha256,
+      ],
+      { encoding: 'utf8', cwd: exportedScriptsDir, timeout: 8000 }
+    );
+
+    let exportedParityOk = false;
+    let exportedReportAuditValid = false;
+    if (probeValidRun.status === 0) {
+      const exportedReportFile = path.join(zoneBExportedRunnerOut, 'stage0-sanitized-report.json');
+      if (fs.existsSync(exportedReportFile)) {
+        const exportedReport = JSON.parse(
+          fs.readFileSync(exportedReportFile, 'utf8')
+        ) as SanitizedStage0Report;
+        exportedReportAuditValid = auditSanitizedStage0Report(exportedReport).valid;
+        exportedParityOk =
+          exportedReportAuditValid &&
+          exportedReport.securityAudit.manifestSha256 === report.securityAudit.manifestSha256 &&
+          exportedReport.securityAudit.manifestIntegrityVerified === true &&
+          JSON.stringify(exportedReport.securityAudit.pruned86ByRuleId) ===
+            JSON.stringify(report.securityAudit.pruned86ByRuleId) &&
+          exportedReport.securityAudit.reparseOrSymlinkSkippedCount ===
+            report.securityAudit.reparseOrSymlinkSkippedCount &&
+          exportedReport.securityAudit.hardlinkAliasBlockedCount ===
+            report.securityAudit.hardlinkAliasBlockedCount &&
+          exportedReport.securityAudit.mixedContainerQuarantinedCount ===
+            report.securityAudit.mixedContainerQuarantinedCount &&
+          exportedReport.securityAudit.potentialMixedUnscannedCount ===
+            report.securityAudit.potentialMixedUnscannedCount &&
+          exportedReport.reuseInventory.sqliteLedgersInspected.length ===
+            report.reuseInventory.sqliteLedgersInspected.length &&
+          JSON.stringify(exportedReport.formatInventory) ===
+            JSON.stringify(report.formatInventory);
+      }
+    }
+
+    checks.push({
+      checkId: 'EXPORTED_WORKSTATION_RUNNER_PARITY',
+      title: 'Independent Subprocess Proof of Exported Standalone Workstation Runner Parity',
+      passed:
+        probeMissingSha.status !== 0 &&
+        probeWrongSha.status !== 0 &&
+        probeValidRun.status === 0 &&
+        exportedParityOk,
+      measuredDetail: `missingShaExit=${probeMissingSha.status} · wrongShaExit=${probeWrongSha.status} · validExit=${probeValidRun.status} · sanitized=${exportedReportAuditValid} · exactParity=${exportedParityOk}`,
+    });
+
+    // Check H: Verify Zero-Leak Sanitizer rejects injected secret / raw path
     const poisonedClone = {
       ...report,
       leakedSecretField: 'sk-1234567890abcdefghijklmnop',

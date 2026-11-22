@@ -123,6 +123,7 @@ export const SYNTHETIC_VALID_STAGE0_FIXTURE: SanitizedStage0Report = {
     allowlistRootCount: 2,
     manifestId: 'EXT_86_MANIFEST_SYNTHETIC',
     manifestSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    manifestIntegrityVerified: true,
     pruned86ByRuleId: {
       R86_CLIENT_VAULT_01: 14,
       R86_ARCHIVE_MEMBER_02: 2,
