@@ -22,7 +22,7 @@ export const SandboxVerificationPanel: React.FC<SandboxVerificationPanelProps> =
           <div className="text-xs text-slate-500 dark:text-slate-400">
             <span>02. Real Syscall &amp; Canary Proof</span>
             <span className="mx-2" aria-hidden="true">·</span>
-            <span>Isolated Container /tmp Scratch Dir</span>
+            <span>Isolated Container RAM Partition (tmpfs) Scratch Dir</span>
             <span className="mx-2" aria-hidden="true">·</span>
             <span>Does Not Represent Dell Workstation</span>
           </div>
@@ -36,7 +36,7 @@ export const SandboxVerificationPanel: React.FC<SandboxVerificationPanelProps> =
             <code className="font-mono text-xs">chmod 0000</code>, subprocess{' '}
             <code className="font-mono text-xs">cat/ls/grep</code>, ZIP Central Directory binary
             reads, and immutable SQLite <code className="font-mono text-xs">mode=ro&amp;immutable=1</code>{' '}
-            inspection) inside a disposable scratch directory.
+            inspection) inside a disposable RAM Partition (tmpfs) scratch directory.
           </p>
         </div>
 
@@ -60,7 +60,7 @@ export const SandboxVerificationPanel: React.FC<SandboxVerificationPanelProps> =
           <p className="text-xs text-slate-500 dark:text-slate-400 max-w-lg mx-auto">
             Click <strong>Execute Scratch Syscall Suite</strong> to construct real symlinks,
             hardlink inode aliases, mixed ZIP archives, read-only SQLite ledgers, and subprocess
-            canary probes inside an isolated temporary directory.
+            canary probes inside an isolated RAM Partition (tmpfs) directory.
           </p>
         </div>
       ) : (
@@ -70,6 +70,15 @@ export const SandboxVerificationPanel: React.FC<SandboxVerificationPanelProps> =
             <div className="space-y-1">
               <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
                 <span>ORIGIN: {summary.environmentBanner}</span>
+                {summary.scratchBacking?.isRamBacked && (
+                  <>
+                    <span className="mx-2" aria-hidden="true">·</span>
+                    <span>
+                      BACKING: RAM ({summary.scratchBacking.backingFsType} @{' '}
+                      {summary.scratchBacking.mountPoint})
+                    </span>
+                  </>
+                )}
                 <span className="mx-2" aria-hidden="true">·</span>
                 <span>EXECUTED: {summary.executedAtIso}</span>
               </div>

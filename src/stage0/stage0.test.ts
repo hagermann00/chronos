@@ -31,6 +31,11 @@ import {
   WIN32_ATTR_REPARSE_POINT,
 } from './pathSecurity.ts';
 import { computeFourFactorAdapterPriorities } from './priorityModel.ts';
+import {
+  detectLinuxMountFsType,
+  resolveRamScratchBaseDir,
+  verifyRamPartitionPath,
+} from './ramPartition.ts';
 import { runLiveSandboxStage0Verification } from './sandboxVerifier.ts';
 import { auditSanitizedStage0Report } from './sanitizer.ts';
 import {
@@ -157,7 +162,11 @@ test('Requirement 3: Separate Windows NTFS and POSIX security normalization (ADS
 test('Requirement 4, 5 & 6: Real OS syscall sandbox proves manifest SHA-256 auth, zero open() on 86/symlink/hardlink, SQLite quarantine & immutability, strict canary gate, and exported runner parity', () => {
   const summary = runLiveSandboxStage0Verification();
   assert.equal(summary.allPassed, true, JSON.stringify(summary.checks, null, 2));
-  assert.equal(summary.checks.length, 8);
+  assert.equal(summary.checks.length, 9);
+  if (process.platform === 'linux') {
+    assert.equal(summary.scratchBacking.isRamBacked, true);
+    assert.equal(summary.scratchBacking.verifiedByKernel, true);
+  }
   assert.equal(summary.generatedReport.securityAudit.manifestIntegrityVerified, true);
   // Every discovered format in Stage 0 must remain strictly UNVERIFIED
   for (const fmt of summary.generatedReport.formatInventory) {
@@ -809,3 +818,133 @@ test('Audit Blocker 2: SQLite WAL-mode header and -wal/-shm/-journal sidecars fa
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('RAM Partition: kernel tmpfs/ramfs & Win32 DRIVE_RAMDISK verification, fail-closed rejection on persistent disk, and standalone canary RAM scratch execution', () => {
+  const syntheticMountInfo = [
+    '29 1 0:23 / / rw,relatime shared:1 - overlay overlay rw,lowerdir=/mnt/lower,upperdir=/mnt/overlay/upper',
+    '30 29 0:24 / /tmp rw,relatime shared:2 - overlay overlay rw',
+    '31 22 0:27 / /dev/shm rw,nosuid,nodev,relatime shared:5 - tmpfs tmpfs rw',
+    '32 29 0:28 / /mnt/ram/sub rw,relatime shared:6 - ramfs ramfs rw',
+  ].join('\n');
+
+  // Longest-prefix mount resolution on synthetic /proc/self/mountinfo
+  assert.deepEqual(detectLinuxMountFsType('/var/log/syslog', syntheticMountInfo), {
+    fsType: 'overlay',
+    mountPoint: '/',
+  });
+  assert.deepEqual(detectLinuxMountFsType('/tmp/chronos-test', syntheticMountInfo), {
+    fsType: 'overlay',
+    mountPoint: '/tmp',
+  });
+  assert.deepEqual(detectLinuxMountFsType('/dev/shm/chronos-canary-abc', syntheticMountInfo), {
+    fsType: 'tmpfs',
+    mountPoint: '/dev/shm',
+  });
+  assert.deepEqual(detectLinuxMountFsType('/mnt/ram/sub/vault', syntheticMountInfo), {
+    fsType: 'ramfs',
+    mountPoint: '/mnt/ram/sub',
+  });
+
+  // Real Linux /dev/shm kernel tmpfs verification
+  if (process.platform === 'linux' && fs.existsSync('/dev/shm')) {
+    const shmCheck = verifyRamPartitionPath('/dev/shm');
+    assert.equal(shmCheck.isRamBacked, true);
+    assert.equal(shmCheck.backingFsType, 'tmpfs');
+    assert.equal(shmCheck.verifiedByKernel, true);
+  }
+
+  // Windows DRIVE_RAMDISK (6) vs fixed disk (3) verification via win32DriveTypeOverride
+  const winRamDisk = verifyRamPartitionPath('R:\\chronos-scratch', {
+    win32DriveTypeOverride: 6,
+  });
+  assert.equal(winRamDisk.isRamBacked, true);
+  assert.equal(winRamDisk.backingFsType, 'win32_ramdisk');
+  assert.equal(winRamDisk.verifiedByKernel, true);
+
+  const winFixedDisk = verifyRamPartitionPath('C:\\Temp\\chronos-scratch', {
+    win32DriveTypeOverride: 3,
+  });
+  assert.equal(winFixedDisk.isRamBacked, false);
+
+  // Fail-closed rejection when persistent disk is passed with requireRamPartition: true
+  assert.throws(
+    () =>
+      resolveRamScratchBaseDir({
+        preferredRamDir: '/tmp',
+        requireRamPartition: true,
+        mountInfoOverride: syntheticMountInfo,
+      }),
+    (err: unknown) => err instanceof Stage0FailClosedError && err.code === 'FAIL_CLOSED_FS'
+  );
+
+  // Standalone exported stage0-multi-identity-canary.mjs execution against RAM scratch
+  const hasLinuxShm =
+    process.platform === 'linux' &&
+    fs.existsSync('/dev/shm') &&
+    verifyRamPartitionPath('/dev/shm').isRamBacked;
+
+  if (hasLinuxShm) {
+    const bundleDir = fs.mkdtempSync(path.join('/dev/shm', 'chronos-canary-bundle-'));
+    try {
+      const { canaryScriptMjs } = generateWorkstationStage0Scripts(
+        DEFAULT_NTFS_STAGE0_CONFIG,
+        DEFAULT_EXTERNAL_86_MANIFEST
+      );
+      const canaryPath = path.join(bundleDir, 'stage0-multi-identity-canary.mjs');
+      fs.writeFileSync(canaryPath, canaryScriptMjs, 'utf8');
+
+      // 1. Verified RAM scratch (/dev/shm) succeeds and leaves zero leaked chronos-canary-* dirs
+      const shmCanaryRun = spawnSync(
+        process.execPath,
+        [
+          canaryPath,
+          '--ram-scratch-dir',
+          '/dev/shm',
+          '--require-ram-partition',
+          '--test-current-user-must-deny',
+          '--lock-vault-mode-0000',
+        ],
+        { encoding: 'utf8', cwd: bundleDir, timeout: 8000 }
+      );
+      assert.equal(shmCanaryRun.status, 0, shmCanaryRun.stderr || shmCanaryRun.stdout);
+      const shmCanaryJson = JSON.parse(shmCanaryRun.stdout) as {
+        allProtectedIdentitiesDenied?: boolean;
+        scratchBacking?: {
+          isRamBacked?: boolean;
+          backingFsType?: string;
+          verifiedByKernel?: boolean;
+        };
+      };
+      assert.equal(shmCanaryJson.allProtectedIdentitiesDenied, true);
+      assert.equal(shmCanaryJson.scratchBacking?.isRamBacked, true);
+
+      const leakedCanaryDirs = fs
+        .readdirSync('/dev/shm')
+        .filter((name) => name.startsWith('chronos-canary-') && name !== path.basename(bundleDir));
+      assert.deepEqual(leakedCanaryDirs, []);
+
+      // 2. Persistent /tmp rejected fail-closed with exit 2 and RAM_PARTITION_REQUIRED
+      if (!verifyRamPartitionPath('/tmp').isRamBacked) {
+        const tmpRejectRun = spawnSync(
+          process.execPath,
+          [
+            canaryPath,
+            '--ram-scratch-dir',
+            '/tmp',
+            '--require-ram-partition',
+            '--test-current-user-must-deny',
+          ],
+          { encoding: 'utf8', cwd: bundleDir, timeout: 8000 }
+        );
+        assert.equal(tmpRejectRun.status, 2);
+        assert.ok(
+          tmpRejectRun.stderr.includes('RAM_PARTITION_REQUIRED'),
+          `Expected RAM_PARTITION_REQUIRED in stderr, got: ${tmpRejectRun.stderr}`
+        );
+      }
+    } finally {
+      fs.rmSync(bundleDir, { recursive: true, force: true });
+    }
+  }
+});
+

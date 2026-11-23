@@ -255,15 +255,21 @@ export function normalizePosixPath(rawInput: string): PathNormalizationResult {
 
   const normalized = '/' + cleanSegments.join('/');
 
-  // Block dangerous OS pseudo-filesystems as scan roots
+  // Block dangerous OS pseudo-filesystems as scan roots.
+  // Explicit subdirectories strictly under /dev/shm/ (Linux tmpfs RAM partition) are permitted
+  // for ephemeral RAM-backed scratch/staging, while /dev, /dev/shm root, and all device nodes stay blocked.
+  const isDevPseudoFs =
+    normalized === '/dev' ||
+    normalized === '/dev/shm' ||
+    (normalized.startsWith('/dev/') && !normalized.startsWith('/dev/shm/'));
+
   if (
     normalized === '/' ||
     normalized === '/proc' ||
     normalized.startsWith('/proc/') ||
     normalized === '/sys' ||
     normalized.startsWith('/sys/') ||
-    normalized === '/dev' ||
-    normalized.startsWith('/dev/')
+    isDevPseudoFs
   ) {
     return {
       ok: false,

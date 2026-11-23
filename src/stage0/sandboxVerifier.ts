@@ -1,7 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   evaluateCanaryIsolationGate,
@@ -9,6 +8,7 @@ import {
   runIsolatedCanaryAccessTests,
 } from './canaryHarness.ts';
 import { Stage0FailClosedError } from './pathSecurity.ts';
+import { createEphemeralRamScratchDir } from './ramPartition.ts';
 import { auditSanitizedStage0Report } from './sanitizer.ts';
 import { executeStage0Discovery } from './traversalEngine.ts';
 import type { External86Manifest, SanitizedStage0Report, Stage0Config } from './types.ts';
@@ -77,6 +77,12 @@ export interface SandboxVerificationCheck {
 export interface SandboxVerificationSummary {
   executedAtIso: string;
   environmentBanner: 'ISOLATED_CONTAINER_SCRATCH_SANDBOX_NOT_WORKSTATION';
+  scratchBacking: {
+    isRamBacked: boolean;
+    backingFsType: string;
+    mountPoint: string;
+    verifiedByKernel: boolean;
+  };
   allPassed: boolean;
   checks: SandboxVerificationCheck[];
   generatedReport: SanitizedStage0Report;
@@ -87,8 +93,10 @@ function sha256Hex(raw: string): string {
 }
 
 /**
- * Runs a complete, real-syscall Stage 0 verification pass inside a disposable /tmp directory,
- * proving:
+ * Runs a complete, real-syscall Stage 0 verification pass inside a disposable kernel-verified
+ * RAM partition directory (`tmpfs`/`ramfs` on Linux via `/dev/shm`, or explicit RAM disk) with
+ * zero persistent disk writes, proving:
+ * - Verified in-memory RAM partition scratch isolation
  * - Precondition fail-closed (allowlist, manifest SHA-256 authentication)
  * - Pre-open 86 pruning across PATH_PREFIX, POSIX_DEV_INO, FILENAME_EXACT, GLOB_SEGMENT,
  *   ARCHIVE_ENTRY_NAME, REVOKED_CONVERSATION_ID, and KNOWN_MIXED_CONTAINER
@@ -96,12 +104,19 @@ function sha256Hex(raw: string): string {
  * - Mixed-ZIP TOC quarantine AND SQLite quarantine when conversation-level 86 rules exist
  * - SQLite Zone A zero-sidecar immutability when no conversation-level 86 rules apply
  * - Strict multi-identity canary isolation enforcement (requiring every protected identity denied)
- * - Independent subprocess execution of the ACTUAL exported workstation scripts in /tmp with
+ * - Independent subprocess execution of the ACTUAL exported workstation scripts in RAM scratch with
  *   exact security parity against the authoritative engine
  * - Zero-leak output sanitization
  */
-export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
-  const scratchBase = fs.mkdtempSync(path.join(os.tmpdir(), 'chronos-stage0-sandbox-'));
+export function runLiveSandboxStage0Verification(options?: {
+  ramScratchDir?: string;
+  requireRamPartition?: boolean;
+}): SandboxVerificationSummary {
+  const scratch = createEphemeralRamScratchDir('chronos-stage0-sandbox-', {
+    preferredRamDir: options?.ramScratchDir,
+    requireRamPartition: options?.requireRamPartition ?? process.platform === 'linux',
+  });
+  const scratchBase = scratch.scratchDir;
   const zoneARoot = path.join(scratchBase, 'zone_a_scan_root');
   const zoneBOut = path.join(scratchBase, 'zone_b_authorized_output');
   const zoneBExportedRunnerOut = path.join(scratchBase, 'zone_b_exported_runner_output');
@@ -109,6 +124,12 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
   const exportedScriptsDir = path.join(scratchBase, 'standalone_exported_scripts');
 
   const checks: SandboxVerificationCheck[] = [];
+  checks.push({
+    checkId: 'RAM_PARTITION_SCRATCH_ISOLATION',
+    title: 'Ephemeral Sandbox & Canary Scratch Runs on Verified In-Memory RAM Partition (Zero Persistent Disk Writes)',
+    passed: scratch.ramCheck.isRamBacked && scratch.ramCheck.verifiedByKernel,
+    measuredDetail: `backingFs=${scratch.ramCheck.backingFsType} · mount=${scratch.ramCheck.mountPoint} · verifiedByKernel=${scratch.ramCheck.verifiedByKernel}`,
+  });
 
   try {
     fs.mkdirSync(zoneARoot, { recursive: true });
@@ -602,11 +623,17 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
     return {
       executedAtIso: new Date().toISOString(),
       environmentBanner: 'ISOLATED_CONTAINER_SCRATCH_SANDBOX_NOT_WORKSTATION',
+      scratchBacking: {
+        isRamBacked: scratch.ramCheck.isRamBacked,
+        backingFsType: scratch.ramCheck.backingFsType,
+        mountPoint: scratch.ramCheck.mountPoint,
+        verifiedByKernel: scratch.ramCheck.verifiedByKernel,
+      },
       allPassed: checks.every((c) => c.passed),
       checks,
       generatedReport: report,
     };
   } finally {
-    fs.rmSync(scratchBase, { recursive: true, force: true });
+    scratch.cleanup();
   }
 }

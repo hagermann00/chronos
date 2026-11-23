@@ -93,7 +93,7 @@ ${embeddedConfigComment
  * (non-zero exit) if any protected identity is exposed or cannot be impersonated.
  *
  * Usage:
- *   node stage0-multi-identity-canary.mjs --vault-test-dir <isolated-canary-dir> --agent-user <agent-user-1> [--agent-user <agent-user-2>] [--config ./stage0-config.json]
+ *   node stage0-multi-identity-canary.mjs --vault-test-dir <isolated-canary-dir> [--ram-scratch-dir <ram-dir> --require-ram-partition | --use-ram-scratch] --agent-user <agent-user-1> [--agent-user <agent-user-2>] [--config ./stage0-config.json]
  */`;
 
   const probeScriptMjs = bundleAuthoritativeNodeCli('workstationProbeCli.ts', probeBanner);
