@@ -21,10 +21,12 @@ import {
   evaluatePreOpen86Rules,
   normalizePosixPath,
   normalizeWindowsNtfsPath,
+  REPARSE_TAG_CLOUD,
   REPARSE_TAG_MOUNT_POINT,
   Stage0FailClosedError,
   validateStage0Preconditions,
   verifyManifestSha256,
+  WIN32_ATTR_OFFLINE,
   WIN32_ATTR_RECALL_ON_DATA_ACCESS,
   WIN32_ATTR_REPARSE_POINT,
 } from './pathSecurity.ts';
@@ -32,10 +34,19 @@ import { computeFourFactorAdapterPriorities } from './priorityModel.ts';
 import { runLiveSandboxStage0Verification } from './sandboxVerifier.ts';
 import { auditSanitizedStage0Report } from './sanitizer.ts';
 import {
+  checkSqliteSafeForImmutableInspection,
+  inspectSqliteHeaderBytes,
+} from './sqliteGuard.ts';
+import {
   executeStage0Discovery,
   openRegularFileNoFollowVerified,
 } from './traversalEngine.ts';
 import type { External86Manifest, Stage0Config } from './types.ts';
+import {
+  buildSqliteReadOnlyImmutableUri,
+  inspectWin32NtfsHandleNoFollow,
+  verifyWin32NtfsEntryNoFollow,
+} from './win32NtfsGuard.ts';
 
 function sha256(input: string): string {
   return crypto.createHash('sha256').update(input, 'utf8').digest('hex');
@@ -512,6 +523,288 @@ test('Audit P0 #1/#2 & P1 #3/#4: Exported workstation probe & canary scripts enf
     ]);
     assert.equal(strictGateFail.allProtectedIdentitiesDenied, false);
     assert.equal(strictGateFail.protectedIdentitiesExposed, 1);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Audit Blocker 1: Windows NTFS native guard enforces fail-closed availability, cloud placeholders, junctions, hardlinks, NTFS_FILE_ID_128, path escape, and RFC-3986 SQLite URIs', () => {
+  // On non-win32 hosts, native Win32 handle inspection reports unavailable and verifyWin32NtfsEntryNoFollow fails closed
+  if (process.platform !== 'win32') {
+    const nonWinMeta = inspectWin32NtfsHandleNoFollow('D:\\AI_Archives\\chat.json');
+    assert.equal(nonWinMeta.available, false);
+    assert.equal(nonWinMeta.errorCode, 'NOT_WIN32_HOST');
+
+    const failClosedRes = verifyWin32NtfsEntryNoFollow({
+      targetPath: 'D:\\AI_Archives\\chat.json',
+      rootCanonicalKey: 'd:\\ai_archives',
+      rules: [],
+    });
+    assert.equal(failClosedRes.ok, false);
+    assert.equal(failClosedRes.reason, 'WIN32_NATIVE_VERIFICATION_UNAVAILABLE');
+  }
+
+  const baseMeta = {
+    available: true,
+    fileAttributes: 0x20,
+    nNumberOfLinks: 1,
+    volumeSerialHex: '000000001234abcd',
+    fileIdHex: '00000000000000000000000000009999',
+    ntfsFileId128: '000000001234abcd:00000000000000000000000000009999',
+    finalPath: '\\\\?\\D:\\AI_Archives\\Session_01\\chat.json',
+    isDirectory: false,
+    isReparsePoint: false,
+    isCloudHydrationHazard: false,
+    reparseClassification: null,
+  };
+
+  // 1. Clean regular file inside d:\ai_archives -> ok: true
+  const cleanRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\Session_01\\chat.json',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [],
+    metadataOverride: { ...baseMeta },
+  });
+  assert.equal(cleanRes.ok, true);
+
+  // 2. OneDrive cloud placeholder -> ok: false, reason: 'CLOUD_PLACEHOLDER'
+  const cloudRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\Session_01\\cloud_chat.json',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [],
+    metadataOverride: {
+      ...baseMeta,
+      fileAttributes: WIN32_ATTR_OFFLINE | WIN32_ATTR_RECALL_ON_DATA_ACCESS | WIN32_ATTR_REPARSE_POINT,
+      reparseTag: REPARSE_TAG_CLOUD,
+      isReparsePoint: true,
+      isCloudHydrationHazard: true,
+      reparseClassification: 'ONEDRIVE_OR_CLOUD_RECALL_PLACEHOLDER',
+    },
+  });
+  assert.equal(cloudRes.ok, false);
+  assert.equal(cloudRes.reason, 'CLOUD_PLACEHOLDER');
+
+  // 3. NTFS junction -> ok: false, reason: 'REPARSE_OR_SYMLINK'
+  const junctionRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\junction_dir',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [],
+    metadataOverride: {
+      ...baseMeta,
+      fileAttributes: WIN32_ATTR_REPARSE_POINT | 0x10,
+      reparseTag: REPARSE_TAG_MOUNT_POINT,
+      isDirectory: true,
+      isReparsePoint: true,
+      reparseClassification: 'NTFS_JUNCTION_OR_VOLUME_MOUNT',
+    },
+  });
+  assert.equal(junctionRes.ok, false);
+  assert.equal(junctionRes.reason, 'REPARSE_OR_SYMLINK');
+
+  // 4. Revoked NTFS_FILE_ID_128 rule match -> ok: false, reason: 'REVOKED_NTFS_FILE_ID'
+  const revokedIdRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\Session_01\\renamed_alias.json',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [
+      {
+        ruleId: 'R86_NTFS_ID_01',
+        kind: 'NTFS_FILE_ID_128',
+        targetValue: baseMeta.ntfsFileId128.toUpperCase(),
+        reasonCode: 'REVOKED_INODE_ID',
+      },
+    ],
+    metadataOverride: { ...baseMeta },
+  });
+  assert.equal(revokedIdRes.ok, false);
+  assert.equal(revokedIdRes.reason, 'REVOKED_NTFS_FILE_ID');
+  assert.equal(revokedIdRes.matchedRuleId, 'R86_NTFS_ID_01');
+
+  // 5. Hardlink (nNumberOfLinks: 2) -> ok: false, reason: 'HARDLINK'
+  const hardlinkRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\Session_01\\hardlink.json',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [],
+    metadataOverride: {
+      ...baseMeta,
+      nNumberOfLinks: 2,
+    },
+  });
+  assert.equal(hardlinkRes.ok, false);
+  assert.equal(hardlinkRes.reason, 'HARDLINK');
+
+  // 6. Final path escaping scan root -> ok: false, reason: 'PATH_ESCAPE_OR_86'
+  const escapeRes = verifyWin32NtfsEntryNoFollow({
+    targetPath: 'D:\\AI_Archives\\Session_01\\sneaky.json',
+    rootCanonicalKey: 'd:\\ai_archives',
+    rules: [],
+    metadataOverride: {
+      ...baseMeta,
+      finalPath: '\\\\?\\C:\\Windows\\System32\\secret.json',
+    },
+  });
+  assert.equal(escapeRes.ok, false);
+  assert.equal(escapeRes.reason, 'PATH_ESCAPE_OR_86');
+
+  // RFC-3986 SQLite immutable read-only URIs
+  assert.equal(
+    buildSqliteReadOnlyImmutableUri('/ignored/path.sqlite', 7),
+    'file:/proc/self/fd/7?mode=ro&immutable=1'
+  );
+  assert.equal(
+    buildSqliteReadOnlyImmutableUri('\\\\?\\D:\\My Archives\\ledger #1.sqlite'),
+    'file:///D:/My%20Archives/ledger%20%231.sqlite?mode=ro&immutable=1'
+  );
+  assert.equal(
+    buildSqliteReadOnlyImmutableUri('/srv/ai archives/ledger #1.sqlite'),
+    'file:///srv/ai%20archives/ledger%20%231.sqlite?mode=ro&immutable=1'
+  );
+});
+
+test('Audit Blocker 2: SQLite WAL-mode header and -wal/-shm/-journal sidecars fail closed and never mutate Zone A', () => {
+  // Unit tests on inspectSqliteHeaderBytes
+  const validHeader = Buffer.alloc(100, 0);
+  Buffer.from('SQLite format 3\0', 'ascii').copy(validHeader, 0);
+  validHeader[18] = 1;
+  validHeader[19] = 1;
+  const validHdrRes = inspectSqliteHeaderBytes(validHeader);
+  assert.equal(validHdrRes.valid, true);
+  assert.equal(validHdrRes.writeVersion, 1);
+  assert.equal(validHdrRes.readVersion, 1);
+
+  const walHeader = Buffer.from(validHeader);
+  walHeader[18] = 2;
+  walHeader[19] = 2;
+  const walHdrRes = inspectSqliteHeaderBytes(walHeader);
+  assert.equal(walHdrRes.valid, false);
+  assert.equal(walHdrRes.quarantineReason, 'SQLITE_WAL_MODE_HEADER');
+
+  const invalidMagicHeader = Buffer.alloc(100, 0);
+  Buffer.from('NOT A SQLITE DB\0', 'ascii').copy(invalidMagicHeader, 0);
+  const badMagicRes = inspectSqliteHeaderBytes(invalidMagicHeader);
+  assert.equal(badMagicRes.valid, false);
+  assert.equal(badMagicRes.quarantineReason, 'SQLITE_HEADER_INVALID');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chronos-sqlite-wal-guard-'));
+  try {
+    const zoneAWal = path.join(tmpDir, 'zone_a_wal');
+    const zoneAHot = path.join(tmpDir, 'zone_a_hot');
+    const zoneAClean = path.join(tmpDir, 'zone_a_clean');
+    const zoneB = path.join(tmpDir, 'zone_b');
+    fs.mkdirSync(zoneAWal, { recursive: true });
+    fs.mkdirSync(zoneAHot, { recursive: true });
+    fs.mkdirSync(zoneAClean, { recursive: true });
+    fs.mkdirSync(zoneB, { recursive: true });
+
+    const manifestObj: External86Manifest = {
+      schemaVersion: '1.0.0',
+      manifestId: 'M_SQLITE_GUARD_NO_CONV',
+      ownerApprovedAtIso: new Date().toISOString(),
+      rules: [
+        {
+          ruleId: 'R86_UNRELATED_01',
+          kind: 'FILENAME_EXACT',
+          targetValue: 'unrelated_secret.json',
+          reasonCode: 'UNRELATED',
+        },
+      ],
+    };
+    const manifestRaw = JSON.stringify(manifestObj);
+    const manifestHash = sha256(manifestRaw);
+    const manifestPath = path.join(zoneB, 'manifest.json');
+    fs.writeFileSync(manifestPath, manifestRaw, 'utf8');
+
+    const makeConfig = (zoneAPath: string): Stage0Config => ({
+      configVersion: '1.0.0',
+      hostOsMode: 'POSIX',
+      scanRootsAllowlist: [{ alias: 'ROOT_01', absolutePath: zoneAPath, expectedFsMode: 'POSIX' }],
+      external86ManifestPath: manifestPath,
+      zoneBOutputDir: zoneB,
+      workflowWeights: { ...DEFAULT_WORKFLOW_WEIGHTS },
+    });
+
+    // (a) Real WAL-mode DB -> quarantined unscanned even WITHOUT REVOKED_CONVERSATION_ID rules
+    const walDbPath = path.join(zoneAWal, 'wal_mode.sqlite');
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        `import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("PRAGMA journal_mode=WAL"); c.execute("CREATE TABLE wal_events (id TEXT)"); c.execute("INSERT INTO wal_events VALUES ('e1')"); c.commit(); c.close()`,
+        walDbPath,
+      ],
+      { timeout: 3000 }
+    );
+    const walDirBefore = fs.readdirSync(zoneAWal).sort();
+    const walBytesBefore = fs.readFileSync(walDbPath);
+
+    const walRun = executeStage0Discovery({
+      config: makeConfig(zoneAWal),
+      manifestRawJson: manifestRaw,
+      expectedManifestSha256: manifestHash,
+      evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+    });
+    assert.equal(walRun.report.reuseInventory.sqliteLedgersInspected.length, 0);
+    assert.ok(walRun.report.securityAudit.potentialMixedUnscannedCount >= 1);
+    assert.deepEqual(fs.readdirSync(zoneAWal).sort(), walDirBefore);
+    assert.equal(Buffer.compare(fs.readFileSync(walDbPath), walBytesBefore), 0);
+
+    // (b) Rollback-journal DB with sibling -journal hot-journal file -> fails closed & quarantined unscanned
+    const hotDbPath = path.join(zoneAHot, 'hot_journal.sqlite');
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        `import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE hot_events (id TEXT)"); c.execute("INSERT INTO hot_events VALUES ('h1')"); c.commit(); c.close()`,
+        hotDbPath,
+      ],
+      { timeout: 3000 }
+    );
+    const hotJournalPath = `${hotDbPath}-journal`;
+    fs.writeFileSync(hotJournalPath, Buffer.from('hot-journal-sentinel'));
+
+    const hotFd = fs.openSync(hotDbPath, fs.constants.O_RDONLY);
+    try {
+      const guardCheck = checkSqliteSafeForImmutableInspection(hotFd, hotDbPath);
+      assert.equal(guardCheck.safeForImmutableDdlInspection, false);
+      assert.equal(guardCheck.quarantineReason, 'SQLITE_HOT_JOURNAL_PRESENT');
+    } finally {
+      fs.closeSync(hotFd);
+    }
+
+    const hotDirBefore = fs.readdirSync(zoneAHot).sort();
+    const hotBytesBefore = fs.readFileSync(hotDbPath);
+    const hotRun = executeStage0Discovery({
+      config: makeConfig(zoneAHot),
+      manifestRawJson: manifestRaw,
+      expectedManifestSha256: manifestHash,
+      evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+    });
+    assert.equal(hotRun.report.reuseInventory.sqliteLedgersInspected.length, 0);
+    assert.ok(hotRun.report.securityAudit.potentialMixedUnscannedCount >= 1);
+    assert.deepEqual(fs.readdirSync(zoneAHot).sort(), hotDirBefore);
+    assert.equal(Buffer.compare(fs.readFileSync(hotDbPath), hotBytesBefore), 0);
+
+    // (c) Clean rollback-journal DB (no sidecars, header v1/v1) -> inspected cleanly with zero sidecars created
+    const cleanDbPath = path.join(zoneAClean, 'clean_rollback.sqlite');
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        `import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE clean_sessions (id TEXT PRIMARY KEY, state TEXT)"); c.execute("INSERT INTO clean_sessions VALUES ('c1', 'OK')"); c.commit(); c.close()`,
+        cleanDbPath,
+      ],
+      { timeout: 3000 }
+    );
+    const cleanBytesBefore = fs.readFileSync(cleanDbPath);
+    const cleanRun = executeStage0Discovery({
+      config: makeConfig(zoneAClean),
+      manifestRawJson: manifestRaw,
+      expectedManifestSha256: manifestHash,
+      evidenceOrigin: 'SANDBOX_SCRATCH_VERIFICATION',
+    });
+    assert.equal(cleanRun.report.reuseInventory.sqliteLedgersInspected.length, 1);
+    assert.equal(cleanRun.report.reuseInventory.sqliteLedgersInspected[0].tableName, 'clean_sessions');
+    assert.deepEqual(fs.readdirSync(zoneAClean), ['clean_rollback.sqlite']);
+    assert.equal(Buffer.compare(fs.readFileSync(cleanDbPath), cleanBytesBefore), 0);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

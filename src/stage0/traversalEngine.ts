@@ -10,6 +10,7 @@ import {
   verifyManifestSha256,
 } from './pathSecurity.ts';
 import { assertSanitizedStage0Report } from './sanitizer.ts';
+import { checkSqliteSafeForImmutableInspection } from './sqliteGuard.ts';
 import type {
   External86Manifest,
   FormatInventoryRecord,
@@ -21,6 +22,12 @@ import type {
   Stage0Config,
   VendorEcosystemId,
 } from './types.ts';
+import {
+  buildSqliteReadOnlyImmutableUri,
+  inspectWin32NtfsHandleNoFollow,
+  verifyWin32NtfsEntryNoFollow,
+  type Win32SafeCheckResult,
+} from './win32NtfsGuard.ts';
 
 export interface TraversalTelemetry {
   readdirCalls: number;
@@ -56,6 +63,8 @@ const UNSCANNABLE_ARCHIVE_EXTS = new Set([
 export type SafeOpenFailureReason =
   | 'SYMLINK_RACE'
   | 'HARDLINK_RACE'
+  | 'CLOUD_PLACEHOLDER'
+  | 'WIN32_NATIVE_VERIFICATION_UNAVAILABLE'
   | 'REVOKED_INODE_RACE'
   | 'PATH_OR_RULE_RACE'
   | 'STAT_IDENTITY_MISMATCH'
@@ -65,22 +74,63 @@ export type SafeOpenResult =
   | { ok: true; fd: number; fstat: fs.Stats }
   | { ok: false; reason: SafeOpenFailureReason; matchedRuleId?: string };
 
+function mapWin32FailureToSafeOpenResult(
+  res: Extract<Win32SafeCheckResult, { ok: false }>
+): SafeOpenResult {
+  switch (res.reason) {
+    case 'CLOUD_PLACEHOLDER':
+      return { ok: false, reason: 'CLOUD_PLACEHOLDER' };
+    case 'REPARSE_OR_SYMLINK':
+      return { ok: false, reason: 'SYMLINK_RACE' };
+    case 'HARDLINK':
+      return { ok: false, reason: 'HARDLINK_RACE' };
+    case 'REVOKED_NTFS_FILE_ID':
+      return {
+        ok: false,
+        reason: 'REVOKED_INODE_RACE',
+        matchedRuleId: res.matchedRuleId,
+      };
+    case 'PATH_ESCAPE_OR_86':
+      return {
+        ok: false,
+        reason: 'PATH_OR_RULE_RACE',
+        matchedRuleId: res.matchedRuleId,
+      };
+    case 'WIN32_NATIVE_VERIFICATION_UNAVAILABLE':
+      return { ok: false, reason: 'WIN32_NATIVE_VERIFICATION_UNAVAILABLE' };
+  }
+}
+
 /**
  * Atomically opens a regular file with O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
  * and verifies post-open fstat() + Linux /proc/self/fd containment invariants against the
- * pre-open lstat() snapshot to eliminate check-to-open (TOCTOU) symlink, hardlink, FIFO,
- * and mount/rename races before any payload bytes are read.
+ * pre-open lstat() snapshot (and Win32 NTFS handle attributes on Windows) to eliminate
+ * check-to-open (TOCTOU) symlink, hardlink, FIFO, and mount/rename races before any payload bytes are read.
  */
 export function openRegularFileNoFollowVerified(params: {
   fullPath: string;
   entryName: string;
   expectedStat: fs.Stats;
   rootRealPath: string;
+  rootCanonicalKey?: string;
   mode: OsPlatformMode;
   ntfsCaseSensitiveDir?: boolean;
   revokedPosixDevInos: Set<string>;
   rules: Rule86Entry[];
 }): SafeOpenResult {
+  let preWin: Win32SafeCheckResult | null = null;
+  if (process.platform === 'win32') {
+    preWin = verifyWin32NtfsEntryNoFollow({
+      targetPath: params.fullPath,
+      rootCanonicalKey: params.rootCanonicalKey ?? params.rootRealPath,
+      ntfsCaseSensitiveDir: params.ntfsCaseSensitiveDir,
+      rules: params.rules,
+    });
+    if (!preWin.ok) {
+      return mapWin32FailureToSafeOpenResult(preWin);
+    }
+  }
+
   const fsConsts = fs.constants as Record<string, number>;
   const openFlags =
     fs.constants.O_RDONLY |
@@ -110,6 +160,23 @@ export function openRegularFileNoFollowVerified(params: {
     if (fst.dev !== params.expectedStat.dev || fst.ino !== params.expectedStat.ino) {
       fs.closeSync(fd);
       return { ok: false, reason: 'STAT_IDENTITY_MISMATCH' };
+    }
+
+    if (process.platform === 'win32') {
+      const postWin = verifyWin32NtfsEntryNoFollow({
+        targetPath: params.fullPath,
+        rootCanonicalKey: params.rootCanonicalKey ?? params.rootRealPath,
+        ntfsCaseSensitiveDir: params.ntfsCaseSensitiveDir,
+        rules: params.rules,
+      });
+      if (!postWin.ok) {
+        fs.closeSync(fd);
+        return mapWin32FailureToSafeOpenResult(postWin);
+      }
+      if (!preWin || !preWin.ok || postWin.meta.ntfsFileId128 !== preWin.meta.ntfsFileId128) {
+        fs.closeSync(fd);
+        return { ok: false, reason: 'STAT_IDENTITY_MISMATCH' };
+      }
     }
 
     const postDevIno = `${fst.dev}:${fst.ino}`;
@@ -191,16 +258,36 @@ export function openRegularFileNoFollowVerified(params: {
 function verifyDirectoryNoFollow(params: {
   dirPath: string;
   rootRealPath: string;
+  rootCanonicalKey?: string;
   rootDirDev: number;
   submountPaths: Set<string>;
+  ntfsCaseSensitiveDir?: boolean;
+  rules?: Rule86Entry[];
 }): 'OK' | 'SYMLINK' | 'MOUNT_CROSSING' | 'ERROR' {
   if (params.submountPaths.has(params.dirPath)) {
     return 'MOUNT_CROSSING';
   }
 
+  if (process.platform === 'win32') {
+    const winCheck = verifyWin32NtfsEntryNoFollow({
+      targetPath: params.dirPath,
+      rootCanonicalKey: params.rootCanonicalKey ?? params.rootRealPath,
+      ntfsCaseSensitiveDir: params.ntfsCaseSensitiveDir,
+      rules: params.rules ?? [],
+      expectDirectory: true,
+    });
+    if (!winCheck.ok) {
+      return winCheck.reason === 'REPARSE_OR_SYMLINK' ? 'SYMLINK' : 'ERROR';
+    }
+    if (!winCheck.meta.isDirectory) {
+      return 'ERROR';
+    }
+    return 'OK';
+  }
+
   const fsConsts = fs.constants as Record<string, number>;
   const oDirectory = fsConsts.O_DIRECTORY;
-  if (process.platform !== 'win32' && typeof oDirectory === 'number') {
+  if (typeof oDirectory === 'number') {
     const dirFlags =
       fs.constants.O_RDONLY |
       oDirectory |
@@ -361,11 +448,13 @@ export function inspectSqliteSchemaImmutableReadOnly(
   expectedStat?: Pick<fs.Stats, 'dev' | 'ino'>
 ): SqliteTableSchemaSummary[] | null {
   try {
+    const fallbackUri = buildSqliteReadOnlyImmutableUri(sqlitePath);
     const pyScript = `
 import json, os, sqlite3, stat, sys, urllib.parse
 p = sys.argv[1]
 exp_dev = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != "" else None
 exp_ino = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else None
+fallback_uri = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != "" else "file:" + urllib.parse.quote(p) + "?mode=ro&immutable=1"
 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 fd = os.open(p, flags)
 try:
@@ -376,11 +465,15 @@ try:
         sys.exit(12)
     if exp_ino is not None and st.st_ino != exp_ino:
         sys.exit(13)
+    os.lseek(fd, 0, os.SEEK_SET)
+    hdr = os.read(fd, 100)
+    if len(hdr) < 100 or hdr[:16] != b"SQLite format 3\\x00" or hdr[18] != 1 or hdr[19] != 1:
+        sys.exit(14)
     fd_path = f"/proc/self/fd/{fd}"
     if os.path.exists(fd_path):
         uri = f"file:{fd_path}?mode=ro&immutable=1"
     else:
-        uri = "file:" + urllib.parse.quote(p) + "?mode=ro&immutable=1"
+        uri = fallback_uri
     conn = sqlite3.connect(uri, uri=True)
     cur = conn.cursor()
     tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
@@ -406,6 +499,7 @@ finally:
       sqlitePath,
       expectedStat ? String(expectedStat.dev) : '',
       expectedStat ? String(expectedStat.ino) : '',
+      fallbackUri,
     ];
 
     const stdout = execFileSync('python3', pyArgs, {
@@ -593,7 +687,55 @@ function writeZoneBReportNoFollow(zoneBOutputDir: string, serializedReportJson: 
     fs.mkdirSync(zoneBOutputDir, { recursive: true });
   }
 
+  if (process.platform === 'win32') {
+    const dirMeta = inspectWin32NtfsHandleNoFollow(zoneBOutputDir);
+    if (
+      !dirMeta.available ||
+      dirMeta.isReparsePoint ||
+      dirMeta.isCloudHydrationHazard ||
+      !dirMeta.isDirectory
+    ) {
+      throw new Stage0FailClosedError(
+        'FAIL_CLOSED_FS',
+        'ZONE_B_WIN32_UNSAFE',
+        'Refusing to write Stage 0 report: Zone B output directory failed Win32 NTFS safety verification.'
+      );
+    }
+  }
+
   const outPath = path.join(zoneBOutputDir, 'stage0-sanitized-report.json');
+  if (process.platform === 'win32') {
+    let outExists = false;
+    try {
+      fs.lstatSync(outPath);
+      outExists = true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        throw new Stage0FailClosedError(
+          'FAIL_CLOSED_FS',
+          'ZONE_B_WIN32_UNSAFE',
+          'Refusing to write Stage 0 report: unable to lstat Zone B target path on Win32.'
+        );
+      }
+    }
+    if (outExists) {
+      const outMeta = inspectWin32NtfsHandleNoFollow(outPath);
+      if (
+        !outMeta.available ||
+        outMeta.isReparsePoint ||
+        outMeta.isCloudHydrationHazard ||
+        outMeta.isDirectory ||
+        outMeta.nNumberOfLinks > 1
+      ) {
+        throw new Stage0FailClosedError(
+          'FAIL_CLOSED_FS',
+          'ZONE_B_WIN32_UNSAFE',
+          'Refusing to write Stage 0 report: Zone B target file failed Win32 NTFS safety verification.'
+        );
+      }
+    }
+  }
   const fsConsts = fs.constants as Record<string, number>;
   const writeFlags =
     fs.constants.O_WRONLY |
@@ -713,11 +855,28 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
   let reparseOrSymlinkSkippedCount = 0;
   let mountCrossingSkippedCount = 0;
   let hardlinkAliasBlockedCount = 0;
-  const cloudPlaceholderSkippedCount = 0;
+  let cloudPlaceholderSkippedCount = 0;
   let mixedContainerQuarantinedCount = 0;
   let potentialMixedUnscannedCount = 0;
   let failClosedUncertainCount = 0;
   let ggufHeaderCount = 0;
+
+  const recordOpenFailure = (failed: Extract<SafeOpenResult, { ok: false }>): void => {
+    if (failed.reason === 'SYMLINK_RACE') {
+      reparseOrSymlinkSkippedCount += 1;
+    } else if (failed.reason === 'HARDLINK_RACE') {
+      hardlinkAliasBlockedCount += 1;
+    } else if (failed.reason === 'CLOUD_PLACEHOLDER') {
+      cloudPlaceholderSkippedCount += 1;
+    } else if (
+      failed.reason === 'REVOKED_INODE_RACE' ||
+      failed.reason === 'PATH_OR_RULE_RACE'
+    ) {
+      record86Hit(failed.matchedRuleId ?? 'R86_RACE_HIT');
+    } else {
+      failClosedUncertainCount += 1;
+    }
+  };
 
   const sqliteSchemas: SqliteTableSchemaSummary[] = [];
   let sqliteIdx = 1;
@@ -811,8 +970,11 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
       const dirStatus = verifyDirectoryNoFollow({
         dirPath: currentDir,
         rootRealPath,
+        rootCanonicalKey: root.canonicalKey,
         rootDirDev,
         submountPaths,
+        ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
+        rules: manifest.rules,
       });
       if (dirStatus === 'SYMLINK') {
         reparseOrSymlinkSkippedCount += 1;
@@ -878,6 +1040,33 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
           continue;
         }
 
+        if (process.platform === 'win32') {
+          const winEntry = verifyWin32NtfsEntryNoFollow({
+            targetPath: fullPath,
+            rootCanonicalKey: root.canonicalKey,
+            ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
+            rules: manifest.rules,
+            expectDirectory: st.isDirectory(),
+          });
+          if (!winEntry.ok) {
+            if (winEntry.reason === 'CLOUD_PLACEHOLDER') {
+              cloudPlaceholderSkippedCount += 1;
+            } else if (winEntry.reason === 'REPARSE_OR_SYMLINK') {
+              reparseOrSymlinkSkippedCount += 1;
+            } else if (winEntry.reason === 'HARDLINK') {
+              hardlinkAliasBlockedCount += 1;
+            } else if (
+              winEntry.reason === 'REVOKED_NTFS_FILE_ID' ||
+              (winEntry.reason === 'PATH_ESCAPE_OR_86' && winEntry.matchedRuleId)
+            ) {
+              record86Hit(winEntry.matchedRuleId ?? 'R86_WIN32_HIT');
+            } else {
+              failClosedUncertainCount += 1;
+            }
+            continue;
+          }
+        }
+
         const posixDevIno = `${st.dev}:${st.ino}`;
 
         // Block hardlink aliases pointing to an 86'd (dev, ino)
@@ -935,19 +1124,14 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
             entryName,
             expectedStat: st,
             rootRealPath,
+            rootCanonicalKey: root.canonicalKey,
             mode: root.expectedFsMode,
             ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
             revokedPosixDevInos,
             rules: manifest.rules,
           });
           if (!opened.ok) {
-            if (opened.reason === 'SYMLINK_RACE') reparseOrSymlinkSkippedCount += 1;
-            else if (opened.reason === 'HARDLINK_RACE') hardlinkAliasBlockedCount += 1;
-            else if (opened.reason === 'REVOKED_INODE_RACE' || opened.reason === 'PATH_OR_RULE_RACE') {
-              record86Hit(opened.matchedRuleId ?? 'R86_RACE_HIT');
-            } else {
-              failClosedUncertainCount += 1;
-            }
+            recordOpenFailure(opened);
             continue;
           }
           try {
@@ -978,18 +1162,66 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
 
         // Mixed-Container Rule 2: SQLite ledgers
         // When conversation-level 86 rules exist, fail closed and quarantine UNSCANNED (zero opens, zero DDL reads).
-        // Only when no conversation-level 86 rules exist, inspect immutable read-only DDL via TOCTOU-verified fd.
+        // Only when no conversation-level 86 rules exist, open via O_NOFOLLOW + verify header/sidecars before immutable DDL read.
         if (ext === '.sqlite' || ext === '.sqlite3' || ext === '.db') {
           if (hasConversationLevel86Rules) {
             potentialMixedUnscannedCount += 1;
             continue;
           }
+          telemetry.openCalls += 1;
+          telemetry.openedPaths.push(fullPath);
+          const opened = openRegularFileNoFollowVerified({
+            fullPath,
+            entryName,
+            expectedStat: st,
+            rootRealPath,
+            rootCanonicalKey: root.canonicalKey,
+            mode: root.expectedFsMode,
+            ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
+            revokedPosixDevInos,
+            rules: manifest.rules,
+          });
+          if (!opened.ok) {
+            recordOpenFailure(opened);
+            continue;
+          }
+          let sqliteSafe = false;
+          let expectedOpenedStat: Pick<fs.Stats, 'dev' | 'ino'> | null = null;
+          try {
+            const sqliteCheck = checkSqliteSafeForImmutableInspection(opened.fd, fullPath);
+            if (!sqliteCheck.safeForImmutableDdlInspection) {
+              if (
+                sqliteCheck.quarantineReason === 'SQLITE_WAL_MODE_HEADER' ||
+                sqliteCheck.quarantineReason === 'SQLITE_WAL_SIDECAR_PRESENT' ||
+                sqliteCheck.quarantineReason === 'SQLITE_SHM_SIDECAR_PRESENT' ||
+                sqliteCheck.quarantineReason === 'SQLITE_HOT_JOURNAL_PRESENT'
+              ) {
+                potentialMixedUnscannedCount += 1;
+              } else {
+                failClosedUncertainCount += 1;
+              }
+              continue;
+            }
+            sqliteSafe = true;
+            expectedOpenedStat = {
+              dev: opened.fstat.dev,
+              ino: opened.fstat.ino,
+            };
+          } finally {
+            fs.closeSync(opened.fd);
+          }
+
+          if (!sqliteSafe || !expectedOpenedStat) {
+            continue;
+          }
+
           const alias = `LEDGER_${String(sqliteIdx).padStart(2, '0')}`;
           sqliteIdx += 1;
-          const ddl = inspectSqliteSchemaImmutableReadOnly(fullPath, alias, {
-            dev: st.dev,
-            ino: st.ino,
-          });
+          const ddl = inspectSqliteSchemaImmutableReadOnly(
+            fullPath,
+            alias,
+            expectedOpenedStat
+          );
           if (ddl === null) {
             failClosedUncertainCount += 1;
           } else {
@@ -1021,19 +1253,14 @@ export function executeStage0Discovery(options: ExecuteStage0Options): {
             entryName,
             expectedStat: st,
             rootRealPath,
+            rootCanonicalKey: root.canonicalKey,
             mode: root.expectedFsMode,
             ntfsCaseSensitiveDir: root.ntfsCaseSensitiveDir,
             revokedPosixDevInos,
             rules: manifest.rules,
           });
           if (!opened.ok) {
-            if (opened.reason === 'SYMLINK_RACE') reparseOrSymlinkSkippedCount += 1;
-            else if (opened.reason === 'HARDLINK_RACE') hardlinkAliasBlockedCount += 1;
-            else if (opened.reason === 'REVOKED_INODE_RACE' || opened.reason === 'PATH_OR_RULE_RACE') {
-              record86Hit(opened.matchedRuleId ?? 'R86_RACE_HIT');
-            } else {
-              failClosedUncertainCount += 1;
-            }
+            recordOpenFailure(opened);
             continue;
           }
           try {

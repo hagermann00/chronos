@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { Stage0FailClosedError } from './pathSecurity.ts';
 import { executeStage0Discovery } from './traversalEngine.ts';
 import type { MultiIdentityCanaryResult, Stage0Config } from './types.ts';
+import { inspectWin32NtfsHandleNoFollow } from './win32NtfsGuard.ts';
 
 function getArgValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -10,6 +11,26 @@ function getArgValue(args: string[], flag: string): string | undefined {
 }
 
 function readRegularFileNoFollowUtf8(filePath: string, errorCode: string): string {
+  const failCode =
+    errorCode === 'FAIL_CLOSED_86_INIT' ? 'FAIL_CLOSED_86_INIT' : 'FAIL_CLOSED_CONFIG';
+
+  if (process.platform === 'win32') {
+    const meta = inspectWin32NtfsHandleNoFollow(filePath);
+    if (
+      !meta.available ||
+      meta.isReparsePoint ||
+      meta.isCloudHydrationHazard ||
+      meta.isDirectory ||
+      meta.nNumberOfLinks > 1
+    ) {
+      throw new Stage0FailClosedError(
+        failCode,
+        'INPUT_FILE_WIN32_UNSAFE',
+        'Refusing to read input file on Win32: failed NTFS no-follow / hardlink / cloud-placeholder check.'
+      );
+    }
+  }
+
   const fsConsts = fs.constants as Record<string, number>;
   const flags =
     fs.constants.O_RDONLY |
@@ -23,7 +44,7 @@ function readRegularFileNoFollowUtf8(filePath: string, errorCode: string): strin
     const fst = fs.fstatSync(fd);
     if (!fst.isFile()) {
       throw new Stage0FailClosedError(
-        errorCode === 'FAIL_CLOSED_86_INIT' ? 'FAIL_CLOSED_86_INIT' : 'FAIL_CLOSED_CONFIG',
+        failCode,
         'INPUT_FILE_NOT_REGULAR',
         'Refusing to read non-regular input file.'
       );
@@ -32,7 +53,7 @@ function readRegularFileNoFollowUtf8(filePath: string, errorCode: string): strin
   } catch (err) {
     if (err instanceof Stage0FailClosedError) throw err;
     throw new Stage0FailClosedError(
-      errorCode === 'FAIL_CLOSED_86_INIT' ? 'FAIL_CLOSED_86_INIT' : 'FAIL_CLOSED_CONFIG',
+      failCode,
       'INPUT_FILE_READ_FAILED',
       `Unable to safely open regular input file (symlinks/missing paths fail closed).`
     );

@@ -165,7 +165,9 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       '[{"id":"conv_ok","mapping":{},"current_node":"1"},{"id":"conv_86_revoked","mapping":{},"current_node":"2"}]'
     );
 
-    // 6. Create a real SQLite ledger in Zone A via python3 sqlite3 to verify quarantine & immutability
+    // 6. Create real SQLite ledgers in Zone A via python3 sqlite3:
+    //    - harness_jobs.sqlite: clean rollback-journal DB (v1/v1, no sidecars)
+    //    - wal_ledger.sqlite: WAL-mode DB (v2/v2 header) that MUST fail closed & quarantine unscanned
     const sqliteDir = path.join(zoneARoot, 'existing_ledger');
     fs.mkdirSync(sqliteDir, { recursive: true });
     const sqlitePath = path.join(sqliteDir, 'harness_jobs.sqlite');
@@ -178,8 +180,19 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       ],
       { timeout: 3000 }
     );
+    const walSqlitePath = path.join(sqliteDir, 'wal_ledger.sqlite');
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        `import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("PRAGMA journal_mode=WAL"); c.execute("CREATE TABLE active_events (id TEXT)"); c.execute("INSERT INTO active_events VALUES ('e1')"); c.commit(); c.close()`,
+        walSqlitePath,
+      ],
+      { timeout: 3000 }
+    );
     const sqliteDirBefore = fs.readdirSync(sqliteDir).sort();
     const sqliteHashBefore = fs.readFileSync(sqlitePath);
+    const walSqliteHashBefore = fs.readFileSync(walSqlitePath);
 
     // 7. Create cleared structured session files (Antigravity, Gemini CLI, Claude Code)
     const cleanDir = path.join(zoneARoot, 'active_sessions');
@@ -428,7 +441,8 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       !telemetry.openedPaths.includes(outsideTarget) &&
       !telemetry.openedPaths.includes(hardlinkAlias) &&
       !telemetry.openedPaths.includes(monoChatGptPath) &&
-      !telemetry.openedPaths.includes(sqlitePath);
+      !telemetry.openedPaths.includes(sqlitePath) &&
+      !telemetry.openedPaths.includes(walSqlitePath);
 
     checks.push({
       checkId: 'ZERO_OPEN_ON_86_SYMLINK_HARDLINK',
@@ -448,7 +462,7 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
     // Check E: Mixed ZIP TOC + Monolithic JSON + SQLite Quarantine when REVOKED_CONVERSATION_ID rules exist
     const sqliteQuarantinedUnderConv86 =
       report.securityAudit.mixedContainerQuarantinedCount === 2 && // KNOWN_MIXED_CONTAINER + mixed ZIP
-      report.securityAudit.potentialMixedUnscannedCount === 2 && // conversations.json + SQLite
+      report.securityAudit.potentialMixedUnscannedCount === 3 && // conversations.json + harness_jobs.sqlite + wal_ledger.sqlite
       report.reuseInventory.sqliteLedgersInspected.length === 0;
 
     checks.push({
@@ -458,8 +472,9 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
       measuredDetail: `mixedQuarantined=${report.securityAudit.mixedContainerQuarantinedCount} · potentialMixedUnscanned=${report.securityAudit.potentialMixedUnscannedCount} · sqliteDdlOpenedUnderConv86=${report.reuseInventory.sqliteLedgersInspected.length}`,
     });
 
-    // Check F: When NO conversation-level 86 rules exist, SQLite immutable DDL inspection runs cleanly
-    // with zero -wal/-shm sidecars and zero byte mutations in Zone A
+    // Check F: When NO conversation-level 86 rules exist, clean rollback-journal SQLite immutable DDL
+    // inspection runs cleanly while WAL-mode SQLite is quarantined unscanned, with zero -wal/-shm
+    // sidecars and zero byte mutations in Zone A
     const noConvManifest: External86Manifest = {
       ...manifest,
       manifestId: 'MANIFEST_SANDBOX_NO_CONV_86',
@@ -476,17 +491,24 @@ export function runLiveSandboxStage0Verification(): SandboxVerificationSummary {
 
     const sqliteDirAfter = fs.readdirSync(sqliteDir).sort();
     const sqliteHashAfter = fs.readFileSync(sqlitePath);
+    const walSqliteHashAfter = fs.readFileSync(walSqlitePath);
+    const inspectedTables = noConvRun.report.reuseInventory.sqliteLedgersInspected.map(
+      (s) => s.tableName
+    );
     const zoneAUntouched =
       JSON.stringify(sqliteDirBefore) === JSON.stringify(sqliteDirAfter) &&
       Buffer.compare(sqliteHashBefore, sqliteHashAfter) === 0 &&
+      Buffer.compare(walSqliteHashBefore, walSqliteHashAfter) === 0 &&
       noConvRun.report.reuseInventory.sqliteLedgersInspected.length === 1 &&
-      noConvRun.report.reuseInventory.sqliteLedgersInspected[0].tableName === 'closeout_sessions';
+      inspectedTables.includes('closeout_sessions') &&
+      !inspectedTables.includes('active_events') &&
+      noConvRun.report.securityAudit.potentialMixedUnscannedCount >= 1;
 
     checks.push({
       checkId: 'ZONE_A_SQLITE_IMMUTABILITY',
-      title: 'Zone A Read-Only SQLite DDL Inspection When Cleared (Zero -wal/-shm Sidecars or Byte Mutations)',
+      title: 'Zone A Read-Only SQLite DDL Inspection When Cleared (WAL Quarantined + Zero Sidecars or Byte Mutations)',
       passed: zoneAUntouched,
-      measuredDetail: `Zone A files=${sqliteDirAfter.join(',')} · DDL tables=${noConvRun.report.reuseInventory.sqliteLedgersInspected.map((s) => s.tableName).join(',')} · Row payloads read=0`,
+      measuredDetail: `Zone A files=${sqliteDirAfter.join(',')} · DDL tables=${inspectedTables.join(',')} · walQuarantined=${noConvRun.report.securityAudit.potentialMixedUnscannedCount} · Row payloads read=0`,
     });
 
     // Check G: Independently execute the ACTUAL exported standalone workstation probe in /tmp
